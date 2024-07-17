@@ -85,6 +85,7 @@ class LLaMAConfigurator(object):
         config.num_attention_heads = 32
         config.num_key_value_heads = 32
         config.initializer_range = 1.0
+        # config.initializer_range = 0.03608439182
         config.rms_norm_eps = 1e-6
         config.max_position_embeddings = 2048
         config.rope_theta = 1e4
@@ -111,6 +112,15 @@ class LLaMAConfigurator(object):
                 num_hidden_layers=2,
                 num_attention_heads=4,
                 num_key_value_heads=4,
+                rms_norm_eps=1e-6,
+            ),
+            'small': dict(
+                base_model='llama_1b',
+                hidden_size=768,
+                intermediate_size=1920,
+                num_hidden_layers=12,
+                num_attention_heads=12,
+                num_key_value_heads=12,
                 rms_norm_eps=1e-6,
             ),
             'llama_1b': dict(
@@ -326,6 +336,7 @@ class FlaxLLaMAAttention(nn.Module):
 
     def setup(self):
         config = self.config
+        initializer_std = self.config.initializer_range / jnp.sqrt(self.config.hidden_size)
         head_dim = config.hidden_size // config.num_attention_heads
 
         self.wq = nn.Dense(
@@ -333,7 +344,7 @@ class FlaxLLaMAAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=jax.nn.initializers.truncated_normal(initializer_std, lower=-3*initializer_std, upper=3*initializer_std),
             precision=self.precision,
         )
         self.wk = nn.Dense(
@@ -341,7 +352,7 @@ class FlaxLLaMAAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=jax.nn.initializers.truncated_normal(initializer_std, lower=-3*initializer_std, upper=3*initializer_std),
             precision=self.precision,
         )
         self.wv = nn.Dense(
@@ -349,7 +360,7 @@ class FlaxLLaMAAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=jax.nn.initializers.truncated_normal(initializer_std, lower=-3*initializer_std, upper=3*initializer_std),
             precision=self.precision,
         )
         self.wo = nn.Dense(
@@ -357,7 +368,7 @@ class FlaxLLaMAAttention(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=jax.nn.initializers.truncated_normal(initializer_std, lower=-3*initializer_std, upper=3*initializer_std),
             precision=self.precision,
         )
 
@@ -532,13 +543,14 @@ class FlaxLLaMAMLP(nn.Module):
 
     def setup(self) -> None:
         config = self.config
+        initializer_std = self.config.initializer_range / jnp.sqrt(self.config.hidden_size)
 
         self.w1 = nn.Dense(
             config.intermediate_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=jax.nn.initializers.truncated_normal(initializer_std, lower=-3*initializer_std, upper=3*initializer_std),
             precision=self.precision,
         )
         self.w2 = nn.Dense(
@@ -546,7 +558,7 @@ class FlaxLLaMAMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=jax.nn.initializers.truncated_normal(initializer_std, lower=-3*initializer_std, upper=3*initializer_std),
             precision=self.precision,
         )
         self.w3 = nn.Dense(
@@ -554,7 +566,7 @@ class FlaxLLaMAMLP(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(self.config.initializer_range),
+            kernel_init=jax.nn.initializers.truncated_normal(initializer_std, lower=-3*initializer_std, upper=3*initializer_std),
             precision=self.precision,
         )
         self.dropout = nn.Dropout(rate=self.config.residue_dropout)
@@ -878,7 +890,7 @@ class FlaxLLaMAModule(nn.Module):
         self.wte = nn.Embed(
             self.config.vocab_size,
             self.config.hidden_size,
-            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            embedding_init=jax.nn.initializers.normal(stddev=self.config.initializer_range / jnp.sqrt(self.config.hidden_size)),
             dtype=self.dtype,
             param_dtype=self.param_dtype,
         )
@@ -951,13 +963,14 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
     precision: Optional[Union[jax.lax.Precision, str]]=None
 
     def setup(self):
+        initializer_std = self.config.initializer_range / jnp.sqrt(self.config.hidden_size)
         self.transformer = FlaxLLaMAModule(self.config, dtype=self.dtype)
         self.lm_head = nn.Dense(
             self.config.vocab_size,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.normal(stddev=self.config.initializer_range),
+            kernel_init=jax.nn.initializers.truncated_normal(stddev=initializer_std, low=-3*initializer_std, high=3*initializer_std),
             precision=self.precision,
         )
 

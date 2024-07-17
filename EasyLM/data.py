@@ -131,7 +131,7 @@ class HuggingfaceDataset(object):
     @staticmethod
     def get_default_config(updates=None):
         config = mlxu.config_dict()
-        config.path = 'c4'
+        config.path = 'allenai/c4'
         config.name = 'en'
         config.split = 'train'
         config.streaming = False
@@ -143,6 +143,7 @@ class HuggingfaceDataset(object):
 
     def __init__(self, config, tokenizer, text_processor):
         self.config = self.get_default_config(config)
+        print(config,self.config)
         name = self.config.name if self.config.name != '' else None
         split = self.config.split if self.config.split != '' else None
         self._tokenizer = tokenizer

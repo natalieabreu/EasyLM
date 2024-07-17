@@ -4,6 +4,8 @@ from functools import partial
 from tqdm import tqdm, trange
 import numpy as np
 import mlxu
+import subprocess as sp
+import neural_tangents as nt
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +14,8 @@ from jax.sharding import PartitionSpec as PS
 from flax.training.train_state import TrainState
 from transformers import AutoTokenizer
 
+import optax
+
 from EasyLM.data import DatasetFactory
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.optimizers import OptimizerFactory
@@ -19,7 +23,7 @@ from EasyLM.jax_utils import (
     JaxRNG, JaxDistributedConfig, next_rng, match_partition_rules,
     cross_entropy_loss_and_accuracy, global_norm, get_float_dtype_by_name,
     set_random_seed, average_metrics, make_shard_and_gather_fns,
-    with_sharding_constraint,
+    with_sharding_constraint, cross_entropy_loss_and_accuracy_with_weight_decay
 )
 from EasyLM.models.llama.llama_model import (
     LLaMAConfigurator, FlaxLLaMAForCausalLMModule
@@ -40,6 +44,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     save_model_freq=0,
     save_milestone_freq=0,
     eval_steps=0,
+    eval_freq=0,
     tokenizer='openlm-research/open_llama_3b_v2',
     train_dataset=DatasetFactory.get_default_config(),
     eval_dataset=DatasetFactory.get_default_config(),
@@ -50,6 +55,12 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     log_all_worker=False,
     jax_distributed=JaxDistributedConfig.get_default_config(),
 )
+
+def get_gpu_memory():
+    command = "nvidia-smi --query-gpu=memory.free --format=csv"
+    memory_free_info = sp.check_output(command.split()).decode('ascii').split('\n')[:-1][1:]
+    memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
+    return memory_free_values
 
 
 def main(argv):
@@ -111,14 +122,74 @@ def main(argv):
             )
         grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
         (loss, accuracy), grads = grad_fn(train_state.params)
+        try:
+            perplexity = jnp.exp(loss)
+        except OverflowError:
+            perplexity = jnp.float32("inf")
         train_state = train_state.apply_gradients(grads=grads)
         metrics = dict(
             loss=loss,
+            perplexity=perplexity,
             accuracy=accuracy,
             learning_rate=optimizer_info['learning_rate_schedule'](train_state.step),
             gradient_norm=global_norm(grads),
             param_norm=global_norm(train_state.params),
+            gpu_memory=get_gpu_memory()[0],
         )
+        return train_state, rng_generator(), metrics
+    
+    def train_step_tayl(train_state, rng, batch, **kwargs):
+        rng_generator = JaxRNG(rng)
+        f_tayl = nt.taylor_expand(model.apply, train_state.params, 2)
+        # f_tayl = jax.block_until_ready(f_tayl)
+        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+
+        # lr = kwargs['learning_rate']
+        # wd = kwargs['weight_decay']
+        # step = kwargs['step']
+        lr = 0.00001
+        wd = 0.5
+
+        # @partial(jax.jit, static_argnums=0)
+        def apply_taylor_fn(f_tayl, batch, rng, new_params, old_params, weight_decay):
+            rng_generator = JaxRNG(rng)
+            def loss_and_accuracy(params, old_params):
+                logits = f_tayl(
+                    params, batch['input_tokens'], deterministic=False,
+                    rngs=rng_generator(LLaMAConfigurator.rng_keys()),
+                ).logits
+
+                return cross_entropy_loss_and_accuracy_with_weight_decay(logits, batch['target_tokens'], params, old_params, batch['loss_masks'], weight_decay=weight_decay)
+
+            grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
+            (loss, accuracy), grads = grad_fn(new_params, old_params)
+            return grads, loss, accuracy
+
+        new_params = train_state.params
+        tayl_solver = optax.adam(learning_rate=lr) # TODO: check this?
+        opt_state = tayl_solver.init(new_params)
+        apply_fn_jit = jax.jit(apply_taylor_fn, static_argnums=0)
+
+        for i in range(100):
+            grads, loss, accuracy = apply_fn_jit(f_tayl, batch, rng, new_params, train_state.params, wd) # TODO: fix weight decay param
+            updates, opt_state = tayl_solver.update(grads, opt_state, new_params)
+            new_params = optax.apply_updates(new_params, updates)
+
+        train_state = train_state.replace(
+            step=train_state.step+1,
+            params=new_params
+        ) 
+
+        metrics = dict(
+            loss=loss,
+            accuracy=accuracy,
+            learning_rate=optimizer_info['learning_rate_schedule'](train_state.step), # doesn't mean anything for taylor
+            gradient_norm=global_norm(grads), # not sure if this is accurate?
+            param_norm=global_norm(train_state.params),
+            gpu_memory=get_gpu_memory()[0],
+        )
+        # jax.clear_caches()
+        del apply_taylor_fn, apply_fn_jit
         return train_state, rng_generator(), metrics
 
     def eval_step(train_state, rng, batch):
@@ -131,9 +202,14 @@ def main(argv):
         loss, accuracy = cross_entropy_loss_and_accuracy(
             logits, batch['target_tokens'], batch['loss_masks']
         )
+        try:
+            perplexity = jnp.exp(loss)
+        except OverflowError:
+            perplexity = jnp.float32("inf")
         metrics = dict(
             eval_loss=loss,
             eval_accuracy=accuracy,
+            eval_perplexity=perplexity,
         )
         return rng_generator(), metrics
 
@@ -169,6 +245,7 @@ def main(argv):
         out_shardings=(train_state_partition, PS(), PS()),
         donate_argnums=(0, 1),
     )
+    # sharded_train_step = train_step_tayl
 
     sharded_eval_step = pjit(
         eval_step,
@@ -209,6 +286,10 @@ def main(argv):
             train_state = sharded_create_trainstate_from_params(restored_params)
             del restored_params
 
+        param_count = sum(x.size for x in jax.tree_leaves(train_state.params))
+        param_count = jax.device_get(param_count)
+        logger.log({"param_count": param_count})
+
         start_step = int(jax.device_get(train_state.step))
 
         if FLAGS.save_model_freq > 0:
@@ -224,7 +305,15 @@ def main(argv):
             )
 
             if step % FLAGS.log_freq == 0:
-                if FLAGS.eval_steps > 0:
+                log_metrics = {"step": step}
+                log_metrics.update(metrics)
+                log_metrics.update(dataset_metrics)
+                log_metrics = jax.device_get(log_metrics)
+                logger.log(log_metrics)
+                tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
+            
+            if FLAGS.eval_freq != 0 and FLAGS.eval_steps > 0:
+                if step % FLAGS.eval_freq == 0:
                     eval_metric_list = []
                     for _ in range(FLAGS.eval_steps):
                         eval_batch, _ = next(eval_iterator)
@@ -233,13 +322,6 @@ def main(argv):
                         )
                         eval_metric_list.append(eval_metrics)
                     metrics.update(average_metrics(eval_metric_list))
-
-                log_metrics = {"step": step}
-                log_metrics.update(metrics)
-                log_metrics.update(dataset_metrics)
-                log_metrics = jax.device_get(log_metrics)
-                logger.log(log_metrics)
-                tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
 
             if FLAGS.save_milestone_freq > 0 and (step + 1) % FLAGS.save_milestone_freq == 0:
                 save_checkpoint(train_state, milestone=True)

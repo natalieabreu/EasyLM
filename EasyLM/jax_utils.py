@@ -273,6 +273,43 @@ def cross_entropy_loss_and_accuracy(logits, tokens, valid=None):
     accuracy = jnp.mean(jnp.sum(correct, axis=-1) / valid_text_length)
     return loss, accuracy
 
+# Added for taylor
+def cross_entropy_loss_and_accuracy_with_weight_decay(logits, tokens, new_params, old_params, valid=None, weight_decay=0.0):
+    if valid is None:
+        valid = jnp.ones(tokens.shape[:2])
+    valid = valid.astype(jnp.float32)
+    valid_text_length = jnp.maximum(jnp.sum(valid, axis=-1), 1e-10)
+    logits = logits.astype(jnp.float32) # for numerical stability
+    token_log_prob = jnp.squeeze(
+        jnp.take_along_axis(
+            jax.nn.log_softmax(logits, axis=-1),
+            jnp.expand_dims(tokens, -1),
+            axis=-1,
+        ),
+        -1,
+    )
+    token_log_prob = jnp.where(valid > 0.0, token_log_prob, jnp.array(0.0))
+    loss = -jnp.mean(jnp.sum(token_log_prob, axis=-1) / valid_text_length)
+
+    def l2_loss(x, alpha):
+      return alpha * (x ** 2).mean()
+  
+    param_diff = jax.tree_util.tree_map(lambda x, y: x - y, new_params, old_params)
+    loss += sum(
+        l2_loss(w, weight_decay) 
+        for w in jax.tree.leaves(param_diff)
+    )
+
+    # loss += weight_decay * global_norm(param_diff)
+
+    correct = jnp.where(
+        valid > 0.0,
+        jnp.argmax(logits, axis=-1) == tokens,
+        jnp.array(False)
+    )
+    accuracy = jnp.mean(jnp.sum(correct, axis=-1) / valid_text_length)
+    return loss, accuracy
+
 
 def global_norm(tree):
     """ Return the global L2 norm of a pytree. """
