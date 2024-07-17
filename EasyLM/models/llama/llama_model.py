@@ -970,7 +970,7 @@ class FlaxLLaMAForCausalLMModule(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             use_bias=False,
-            kernel_init=jax.nn.initializers.truncated_normal(stddev=initializer_std, low=-3*initializer_std, high=3*initializer_std),
+            kernel_init=jax.nn.initializers.truncated_normal(stddev=initializer_std, lower=-3*initializer_std, upper=3*initializer_std),
             precision=self.precision,
         )
 

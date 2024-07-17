@@ -54,6 +54,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     log_freq=50,
     save_model_freq=0,
     save_milestone_freq=0,
+    eval_freq=0,
     eval_steps=0,
     gradient_accumulation_steps=1,
     learning_rate=0.0001,
@@ -347,9 +348,6 @@ def main(argv):
     #     out_shardings=(train_state_partition, PS(), PS()),
     #     donate_argnums=(0, 1),
     # )
-
-
-    print('Post pjit', get_gpu_memory())
 
     sharded_eval_step = pjit(
         eval_step,
