@@ -7,6 +7,8 @@ import mlxu
 import subprocess as sp
 import neural_tangents as nt
 
+import timeit
+
 import jax
 import jax.numpy as jnp
 from jax.experimental.pjit import pjit
@@ -189,8 +191,95 @@ def main(argv):
             gpu_memory=get_gpu_memory()[0],
         )
         # jax.clear_caches()
-        del apply_taylor_fn, apply_fn_jit
+        # del apply_taylor_fn, apply_fn_jit
         return train_state, rng_generator(), metrics
+    
+    def train_step_tayl_scan(train_state, rng, batch, **kwargs):
+        rng_generator = JaxRNG(rng)
+
+        f_tayl = nt.taylor_expand(model.apply, train_state.params, 2)
+        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+
+        # lr = kwargs['learning_rate']
+        # wd = kwargs['weight_decay']
+        # step = kwargs['step']
+        lr = 0.00001
+        wd = 0.5
+
+        # @partial(jax.jit, static_argnums=0)
+        def apply_taylor_fn(f_tayl, batch, rng, new_params, old_params, weight_decay):
+            rng_generator = JaxRNG(rng)
+            def loss_and_accuracy(params, old_params):
+                logits = f_tayl(
+                    params, batch['input_tokens'], deterministic=False,
+                    rngs=rng_generator(LLaMAConfigurator.rng_keys()),
+                ).logits
+
+                return cross_entropy_loss_and_accuracy_with_weight_decay(logits, batch['target_tokens'], params, old_params, batch['loss_masks'], weight_decay=weight_decay)
+
+            grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
+            (loss, accuracy), grads = grad_fn(new_params, old_params)
+            return grads, loss, accuracy
+
+        new_params = train_state.params
+        tayl_solver = optax.adam(learning_rate=lr)
+        opt_state = tayl_solver.init(new_params)
+        apply_fn_jit = jax.jit(apply_taylor_fn, static_argnums=0)
+
+        def step_fn(carry, _):
+            new_params, opt_state = carry
+            grads, loss, accuracy = apply_fn_jit(f_tayl, batch, rng, new_params, train_state.params, wd)
+            updates, opt_state = tayl_solver.update(grads, opt_state, new_params)
+            new_params = optax.apply_updates(new_params, updates)
+            return (new_params, opt_state), (loss, accuracy, grads)
+
+        # def step_fn(carry, _):
+        #     new_params, opt_state = carry
+            
+        #     # Use jax.checkpoint to reduce memory usage by recomputing intermediate values
+        #     def compute_grads(params):
+        #         grads, loss, accuracy = apply_taylor_fn(f_tayl, batch, rng, params, train_state.params, wd)
+        #         return grads, loss, accuracy
+
+        #     grads, loss, accuracy = jax.checkpoint(compute_grads)(new_params)
+        #     updates, opt_state = tayl_solver.update(grads, opt_state, new_params)
+        #     new_params = optax.apply_updates(new_params, updates)
+            
+        #     return (new_params, opt_state), (loss, accuracy, grads)
+
+        init_carry = (new_params, opt_state)
+        init_steps = None
+
+        # (carry, outputs) = jax.lax.scan(step_fn, init_carry, init_steps, length=10)
+        (carry, outputs) = jax.lax.scan(step_fn, init_carry, init_steps, length=12)
+
+        init_carry = carry
+        init_steps = None
+
+        new_params, opt_state = carry
+        f_tayl = nt.taylor_expand(model.apply, new_params, 2)
+        (carry, outputs) = jax.lax.scan(step_fn, init_carry, init_steps, length=50)
+        new_params, opt_state = carry
+        loss, accuracy, grads = outputs
+
+
+        train_state = train_state.replace(
+            step=train_state.step + 1,
+            params=new_params
+        )
+
+        metrics = dict(
+            loss=loss[-1],
+            accuracy=accuracy[-1],
+            learning_rate=optimizer_info['learning_rate_schedule'](train_state.step), # doesn't mean anything for taylor
+            gradient_norm=global_norm(grads), # not sure if this is accurate?
+            param_norm=global_norm(train_state.params),
+            gpu_memory=get_gpu_memory()[0],
+        )
+        # jax.clear_caches()
+        # del apply_taylor_fn, apply_fn_jit
+        return train_state, rng_generator(), metrics
+
 
     def eval_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
@@ -245,7 +334,7 @@ def main(argv):
         out_shardings=(train_state_partition, PS(), PS()),
         donate_argnums=(0, 1),
     )
-    # sharded_train_step = train_step_tayl
+    # sharded_train_step = train_step_tayl_scan
 
     sharded_eval_step = pjit(
         eval_step,
@@ -322,6 +411,9 @@ def main(argv):
                         )
                         eval_metric_list.append(eval_metrics)
                     metrics.update(average_metrics(eval_metric_list))
+                    # metrics.update({"step": step})
+                    metrics = jax.device_get(metrics)
+                    logger.log(metrics)
 
             if FLAGS.save_milestone_freq > 0 and (step + 1) % FLAGS.save_milestone_freq == 0:
                 save_checkpoint(train_state, milestone=True)

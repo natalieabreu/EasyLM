@@ -179,120 +179,6 @@ def main(argv):
         )
         return train_state, rng_generator(), metrics
         
-    
-    # Taylor method that changes batch within inner loop by passing in a larger global batch and splitting it
-    # Doesn't really work with memory constraints
-    def train_step_tayl_minibatch(train_state, rng, batch, **kwargs):
-        rng_generator = JaxRNG(rng)
-        f_tayl = nt.taylor_expand(model.apply, train_state.params, 1)
-        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
-
-        def apply_taylor_fn(f_tayl, batch, rng, new_params, old_params, weight_decay):
-            rng_generator = JaxRNG(rng)
-            def loss_and_accuracy(params, old_params):
-                logits = f_tayl(
-                    params, batch['input_tokens'], deterministic=False,
-                    rngs=rng_generator(LLaMAConfigurator.rng_keys()),
-                ).logits
-
-                return cross_entropy_loss_and_accuracy_with_weight_decay(logits, batch['target_tokens'], params, old_params, batch['loss_masks'], weight_decay=weight_decay)
-
-            grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
-            (loss, accuracy), grads = grad_fn(new_params, old_params)
-            return grads, loss, accuracy
-
-        lr = kwargs['learning_rate']
-        wd = kwargs['weight_decay']
-
-        new_params = train_state.params
-        tayl_solver = optax.adam(learning_rate=lr) # TODO: check this?
-        jax.debug.print(str(optimizer_info['learning_rate_schedule'](train_state.step)))
-        opt_state = tayl_solver.init(new_params)
-
-        inner_loop_iter = 100
-        batch_size = batch['input_tokens'].shape[0]
-        minibatch_size = batch_size // inner_loop_iter
-        for j in range(0, batch_size, minibatch_size):
-
-            minibatch = {
-                'input_tokens': batch['input_tokens'][j:j+minibatch_size],
-                'target_tokens': batch['target_tokens'][j:j+minibatch_size],
-                'loss_masks': batch['loss_masks'][j:j+minibatch_size]
-            }
-            grads, loss, accuracy = apply_taylor_fn(f_tayl, minibatch, rng, new_params, train_state.params, 0.5) # TODO: fix weight decay param
-            updates, opt_state = tayl_solver.update(grads, opt_state, new_params)
-            new_params = optax.apply_updates(new_params, updates)
-
-        train_state = train_state.replace(
-            step=train_state.step+1,
-            params=new_params
-        ) 
-        # train_state = train_state.apply_gradients(grads=grads)
-        metrics = dict(
-            loss=loss,
-            accuracy=accuracy,
-            learning_rate=optimizer_info['learning_rate_schedule'](train_state.step), # doesn't mean anything for taylor
-            gradient_norm=global_norm(grads), # not sure if this is accurate?
-            param_norm=global_norm(train_state.params),
-            gpu_memory=get_gpu_memory()[0],
-        )
-        jax.clear_caches()
-        return train_state, rng_generator(), metrics
-
-
-    # Old taylor method with fixed batch within inner loop
-    def train_step_tayl(train_state, rng, batch, **kwargs):
-        rng_generator = JaxRNG(rng)
-        f_tayl = nt.taylor_expand(model.apply, train_state.params, 2)
-        batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
-
-        # lr = kwargs['learning_rate']
-        # wd = kwargs['weight_decay']
-        lr = 0.0001
-        wd = 0.5
-
-        # Important to define this function within the train_step_tayl function!
-        def apply_taylor_fn(f_tayl, batch, rng, new_params, old_params, weight_decay):
-            rng_generator = JaxRNG(rng)
-            def loss_and_accuracy(params, old_params):
-                logits = f_tayl(
-                    params, batch['input_tokens'], deterministic=False,
-                    rngs=rng_generator(LLaMAConfigurator.rng_keys()),
-                ).logits
-
-                return cross_entropy_loss_and_accuracy_with_weight_decay(logits, batch['target_tokens'], params, old_params, batch['loss_masks'], weight_decay=weight_decay)
-
-            grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
-            (loss, accuracy), grads = grad_fn(new_params, old_params)
-            return grads, loss, accuracy
-
-        new_params = train_state.params
-        tayl_solver = optax.adam(learning_rate=lr) 
-        opt_state = tayl_solver.init(new_params)
-        apply_fn_jit = jax.jit(apply_taylor_fn, static_argnums=0)
-
-        for i in range(100):
-            grads, loss, accuracy = apply_fn_jit(f_tayl, batch, rng, new_params, train_state.params, wd)
-            updates, opt_state = tayl_solver.update(grads, opt_state, new_params)
-            new_params = optax.apply_updates(new_params, updates)
-
-        train_state = train_state.replace(
-            step=train_state.step+1,
-            params=new_params
-        ) 
-
-        metrics = dict(
-            loss=loss,
-            accuracy=accuracy,
-            learning_rate=optimizer_info['learning_rate_schedule'](train_state.step), # doesn't mean anything for taylor
-            gradient_norm=global_norm(grads), # not sure if this is accurate?
-            param_norm=global_norm(train_state.params),
-            gpu_memory=get_gpu_memory()[0],
-        )
-        # jax.clear_caches()
-        del apply_taylor_fn, apply_fn_jit
-        return train_state, rng_generator(), metrics
-
 
     def eval_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
@@ -403,7 +289,6 @@ def main(argv):
 
         # step_counter = trange(start_step, FLAGS.total_steps, ncols=0)
 
-        taylor_order = FLAGS.taylor_order
         lr = FLAGS.optimizer.adamw_optimizer.lr
         wd = FLAGS.weight_decay
         gradient_accumulation_steps = FLAGS.gradient_accumulation_steps
@@ -414,21 +299,39 @@ def main(argv):
         with tqdm(initial=start_step, total=FLAGS.total_steps) as progress_bar:
             while not exit:       
                 rng_generator = JaxRNG(sharded_rng)
-                f_tayl = nt.taylor_expand(model.apply, train_state.params, taylor_order)
+                f_tayl = nt.taylor_expand(model.apply, train_state.params, 1)
         
                 def apply_taylor_fn(f_tayl, batch, rng, new_params, old_params, weight_decay):
                     rng_generator = JaxRNG(rng)
+
                     def loss_and_accuracy(params, old_params):
+                        # print(args)
+                        # params = args['params'][0]
+                        # old_params = args['params'][1]
                         logits = f_tayl(
                             params, batch['input_tokens'], deterministic=False,
-                            rngs=rng_generator(LLaMAConfigurator.rng_keys()),
+                            rngs=rng_generator(LLaMAConfigurator.rng_keys())
                         ).logits
 
-                        return cross_entropy_loss_and_accuracy_with_weight_decay(logits, batch['target_tokens'], params, old_params, batch['loss_masks'], weight_decay=weight_decay)
+                        return cross_entropy_loss_and_accuracy_with_weight_decay(
+                            logits, batch['target_tokens'], params, old_params, batch['loss_masks'], weight_decay=weight_decay
+                        )
 
-                    grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
+                    # # Flatten the params dictionary to match expected structure
+                    # flattened_new_params = {'params': {'params': new_params} }
+                    # flattened_old_params = {'params': old_params}
+
+                    # Combine them in a single dictionary
+                    # combined_params =  {'params': new_params, 'old_params': old_params}
+                    combined_params = (new_params, old_params)
+
+                    l_tayl = nt.taylor_expand(loss_and_accuracy, new_params, 2)
+                    grad_fn = jax.value_and_grad(l_tayl, has_aux=True)
+
                     (loss, accuracy), grads = grad_fn(new_params, old_params)
+
                     return grads, loss, accuracy
+
 
                 new_params = train_state.params
                 lr_sched = optax.cosine_decay_schedule(init_value=lr, decay_steps=FLAGS.inner_loop_iter*gradient_accumulation_steps, alpha=FLAGS.optimizer.adamw_optimizer.end_lr)
