@@ -47,7 +47,9 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     save_milestone_freq=0,
     eval_steps=0,
     eval_freq=0,
+    outer_loop_method='None',
     tokenizer='openlm-research/open_llama_3b_v2',
+    train_dataset_batch_size=8,
     train_dataset=DatasetFactory.get_default_config(),
     eval_dataset=DatasetFactory.get_default_config(),
     optimizer=OptimizerFactory.get_default_config(),
@@ -56,6 +58,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     logger=mlxu.WandBLogger.get_default_config(),
     log_all_worker=False,
     jax_distributed=JaxDistributedConfig.get_default_config(),
+    start_step=0,
 )
 
 def get_gpu_memory():
@@ -63,6 +66,26 @@ def get_gpu_memory():
     memory_free_info = sp.check_output(command.split()).decode('ascii').split('\n')[:-1][1:]
     memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
     return memory_free_values
+
+def is_embedding_param(param_name, param_value):
+    if 'embedding' in param_name:
+        return True
+    return False
+
+def count_params(params):
+    non_embedding_count = 0
+    total_count = 0
+
+    for param_name, param_value in jax.tree_util.tree_leaves_with_path(params):
+        # print(param_name[-1].key, is_embedding_param(param_name[-1].key, param_value), jnp.prod(jnp.array(param_value.size)))
+        total_count += jnp.prod(jnp.array(param_value.size))
+        if not is_embedding_param(param_name[-1].key, param_value):
+            non_embedding_count += jnp.prod(jnp.array(param_value.size))
+            print(param_name[-5:], is_embedding_param(param_name[-1].key, param_value), jnp.prod(jnp.array(param_value.size)))
+        else:
+            print(param_name, is_embedding_param(param_name[-1].key, param_value), jnp.prod(jnp.array(param_value.size)))
+    # print(non_embedding_count)
+    return total_count, non_embedding_count
 
 
 def main(argv):
@@ -75,6 +98,8 @@ def main(argv):
         enable=FLAGS.log_all_worker or (jax.process_index() == 0),
     )
     set_random_seed(FLAGS.seed)
+
+    print(FLAGS.train_dataset)
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
@@ -359,6 +384,7 @@ def main(argv):
             milestone=milestone,
         )
 
+    FLAGS.load_checkpoint = 'trainstate_params::/n/holyscratch01/barak_lab/Users/nabreu/SOO-LM/checkpoint/47578767/streaming_train_state_1000' #1000step warmup adam bs=32k lr=0.01
     mesh = LLaMAConfigurator.get_jax_mesh(FLAGS.mesh_dim)
     with mesh:
         train_state, restored_params = None, None
@@ -366,6 +392,7 @@ def main(argv):
             train_state, restored_params = checkpointer.load_trainstate_checkpoint(
                 FLAGS.load_checkpoint, train_state_shapes, shard_fns
             )
+            print('loaded checkpoint')
 
         if train_state is None and restored_params is None:
             # Initialize from scratch
@@ -375,8 +402,11 @@ def main(argv):
             train_state = sharded_create_trainstate_from_params(restored_params)
             del restored_params
 
-        param_count = sum(x.size for x in jax.tree_leaves(train_state.params))
+        # param_count = sum(x.size for x in jax.tree_leaves(train_state.params))
+        param_count, param_count_nonembed = count_params(train_state.params)
         param_count = jax.device_get(param_count)
+        param_count_nonembed = jax.device_get(param_count_nonembed)
+        logger.log({"param_count_nonembed": param_count_nonembed})
         logger.log({"param_count": param_count})
 
         start_step = int(jax.device_get(train_state.step))
@@ -397,28 +427,46 @@ def main(argv):
                 log_metrics = {"step": step}
                 log_metrics.update(metrics)
                 log_metrics.update(dataset_metrics)
+                
+
+                if FLAGS.eval_freq != 0 and FLAGS.eval_steps > 0: # eval_freq must be | by log_freq
+                    if step % FLAGS.eval_freq == 0:
+                        eval_metric_list = []
+                        for _ in range(FLAGS.eval_steps):
+                            eval_batch, _ = next(eval_iterator)
+                            sharded_rng, eval_metrics = sharded_eval_step(
+                                train_state, sharded_rng, eval_batch
+                            )
+                            eval_metric_list.append(eval_metrics)
+                        log_metrics.update(average_metrics(eval_metric_list))
+                        # metrics.update({"step": step})
+                        # metrics = jax.device_get(metrics)
+                        # logger.log(metrics)
                 log_metrics = jax.device_get(log_metrics)
                 logger.log(log_metrics)
                 tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
             
-            if FLAGS.eval_freq != 0 and FLAGS.eval_steps > 0:
-                if step % FLAGS.eval_freq == 0:
-                    eval_metric_list = []
-                    for _ in range(FLAGS.eval_steps):
-                        eval_batch, _ = next(eval_iterator)
-                        sharded_rng, eval_metrics = sharded_eval_step(
-                            train_state, sharded_rng, eval_batch
-                        )
-                        eval_metric_list.append(eval_metrics)
-                    metrics.update(average_metrics(eval_metric_list))
-                    # metrics.update({"step": step})
-                    metrics = jax.device_get(metrics)
-                    logger.log(metrics)
+            
 
             if FLAGS.save_milestone_freq > 0 and (step + 1) % FLAGS.save_milestone_freq == 0:
                 save_checkpoint(train_state, milestone=True)
             elif FLAGS.save_model_freq > 0 and (step + 1) % FLAGS.save_model_freq == 0:
                 save_checkpoint(train_state)
+
+        if FLAGS.eval_freq != 0:
+            log_metrics = {"step": step}
+            eval_metric_list = []
+            for _ in range(FLAGS.eval_steps):
+                eval_batch, _ = next(eval_iterator)
+                sharded_rng, eval_metrics = sharded_eval_step(
+                    train_state, sharded_rng, eval_batch
+                )
+                eval_metric_list.append(eval_metrics)
+            log_metrics.update(average_metrics(eval_metric_list))
+ 
+            log_metrics = jax.device_get(log_metrics)
+            logger.log(log_metrics)
+            tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
 
         if FLAGS.save_model_freq > 0:
             save_checkpoint(train_state)
