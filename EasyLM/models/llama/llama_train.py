@@ -8,6 +8,7 @@ import subprocess as sp
 import neural_tangents as nt
 
 import timeit
+import os
 
 import jax
 import jax.numpy as jnp
@@ -47,6 +48,8 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     save_milestone_freq=0,
     eval_steps=0,
     eval_freq=0,
+    weight_average=False,
+    weight_average_decay=0.99,
     outer_loop_method='None',
     tokenizer='openlm-research/open_llama_3b_v2',
     train_dataset_batch_size=8,
@@ -138,7 +141,9 @@ def main(argv):
 
     def train_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
+
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+
         def loss_and_accuracy(params):
             logits = model.apply(
                 params, batch['input_tokens'], deterministic=False,
@@ -164,6 +169,101 @@ def main(argv):
             gpu_memory=get_gpu_memory()[0],
         )
         return train_state, rng_generator(), metrics
+
+    # def train_step(train_state, rng, batch):
+    #     """
+    #     Perform a training step using microbatches.
+
+    #     Args:
+    #         train_state: Current state of the model, including parameters and optimizer state.
+    #         rng: Random number generator state.
+    #         batch: A dictionary containing input tokens, target tokens, and loss masks.
+    #         num_micro_batches: Number of microbatches to split the batch into.
+
+    #     Returns:
+    #         Updated train_state, new RNG state, and training metrics.
+    #     """
+    #     num_micro_batches = 4
+    #     rng_generator = JaxRNG(rng)
+
+    #     # Split the batch into microbatches
+    #     microbatches = {
+    #         key: jnp.split(value, num_micro_batches, axis=0)
+    #         for key, value in batch.items()
+    #     }
+        
+    #     def loss_and_accuracy(params, microbatch, rngs):
+    #         logits = model.apply(
+    #             params, 
+    #             microbatch['input_tokens'], 
+    #             deterministic=False,
+    #             rngs=rngs,
+    #         ).logits
+    #         return cross_entropy_loss_and_accuracy(
+    #             logits, microbatch['target_tokens'], microbatch['loss_masks']
+    #         )
+        
+    #     def microbatch_step(carry, microbatch_index):
+    #         rngs = rng_generator(LLaMAConfigurator.rng_keys())
+    #         cumulative_grads, total_loss, total_accuracy = carry
+            
+    #         microbatch = {
+    #             key: jax.lax.dynamic_index_in_dim(jax.numpy.array(value), microbatch_index, keepdims=False)
+    #             for key, value in microbatches.items()
+    #         }
+
+    #         grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
+    #         (loss, accuracy), grads = grad_fn(train_state.params, microbatch, rngs)
+
+    #         # Initialize cumulative_grads with the correct structure
+    #         cumulative_grads = jax.tree_map(lambda x: jnp.zeros_like(x), train_state.params)
+
+    #         # Update cumulative_grads in the loop
+    #         cumulative_grads = jax.tree_util.tree_map(
+    #             jnp.add, cumulative_grads, grads
+    #         )
+    #         return (
+    #             cumulative_grads,
+    #             total_loss + loss,
+    #             total_accuracy + accuracy,
+    #         ), None
+
+    #     # Accumulate gradients and metrics over all microbatches
+    #     init_carry = ({}, 0.0, 0.0)  # Use an empty dict instead of None
+
+    #     (cumulative_grads, total_loss, total_accuracy), _ = jax.lax.scan(
+    #         microbatch_step,
+    #         init=init_carry,
+    #         xs=jnp.arange(num_micro_batches)
+    #     )
+        
+    #     # Average the accumulated gradients and metrics
+    #     cumulative_grads = jax.tree_util.tree_map(
+    #         lambda x: x / num_micro_batches, cumulative_grads
+    #     )
+    #     avg_loss = total_loss / num_micro_batches
+    #     avg_accuracy = total_accuracy / num_micro_batches
+
+    #     # Apply gradients to update the model
+    #     train_state = train_state.apply_gradients(grads=cumulative_grads)
+    #     try:
+    #         perplexity = jnp.exp(avg_loss)
+    #     except OverflowError:
+    #         perplexity = jnp.float32("inf")
+        
+    #     metrics = dict(
+    #         loss=avg_loss,
+    #         perplexity=perplexity,
+    #         accuracy=avg_accuracy,
+    #         learning_rate=optimizer_info['learning_rate_schedule'](train_state.step),
+    #         gradient_norm=global_norm(cumulative_grads),
+    #         param_norm=global_norm(train_state.params),
+    #         gpu_memory=get_gpu_memory()[0],
+    #     )
+    #     return train_state, rng_generator(), metrics
+
+
+
     
     def train_step_tayl(train_state, rng, batch, **kwargs):
         rng_generator = JaxRNG(rng)
@@ -306,11 +406,32 @@ def main(argv):
         return train_state, rng_generator(), metrics
 
 
-    def eval_step(train_state, rng, batch):
+    # def eval_step(train_state, rng, batch):
+    #     rng_generator = JaxRNG(rng)
+    #     batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+    #     logits = model.apply(
+    #         train_state.params, batch['input_tokens'], deterministic=True,
+    #         rngs=rng_generator(LLaMAConfigurator.rng_keys()),
+    #     ).logits
+    #     loss, accuracy = cross_entropy_loss_and_accuracy(
+    #         logits, batch['target_tokens'], batch['loss_masks']
+    #     )
+    #     try:
+    #         perplexity = jnp.exp(loss)
+    #     except OverflowError:
+    #         perplexity = jnp.float32("inf")
+    #     metrics = dict(
+    #         eval_loss=loss,
+    #         eval_accuracy=accuracy,
+    #         eval_perplexity=perplexity,
+    #     )
+    #     return rng_generator(), metrics
+
+    def eval_step(params, rng, batch):
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
         logits = model.apply(
-            train_state.params, batch['input_tokens'], deterministic=True,
+            params, batch['input_tokens'], deterministic=True,
             rngs=rng_generator(LLaMAConfigurator.rng_keys()),
         ).logits
         loss, accuracy = cross_entropy_loss_and_accuracy(
@@ -331,6 +452,12 @@ def main(argv):
     train_state_partition = match_partition_rules(
         LLaMAConfigurator.get_partition_rules(), train_state_shapes
     )
+
+    batch_partition = {
+        'input_tokens': PS(('dp', 'fsdp')), 
+        'loss_masks': PS(('dp', 'fsdp')),
+        'target_tokens': PS(('dp', 'fsdp')),
+    }
 
     shard_fns, gather_fns = make_shard_and_gather_fns(
         train_state_partition, train_state_shapes
@@ -355,7 +482,7 @@ def main(argv):
 
     sharded_train_step = pjit(
         train_step,
-        in_shardings=(train_state_partition, PS(), PS()),
+        in_shardings=(train_state_partition, PS(), batch_partition),
         out_shardings=(train_state_partition, PS(), PS()),
         donate_argnums=(0, 1),
     )
@@ -363,7 +490,7 @@ def main(argv):
 
     sharded_eval_step = pjit(
         eval_step,
-        in_shardings=(train_state_partition, PS(), PS()),
+        in_shardings=(train_state_partition.params, PS(), PS()),
         out_shardings=(PS(), PS()),
         donate_argnums=(1,),
     )
@@ -384,9 +511,21 @@ def main(argv):
             milestone=milestone,
         )
 
-    FLAGS.load_checkpoint = 'trainstate_params::/n/holyscratch01/barak_lab/Users/nabreu/SOO-LM/checkpoint/47578767/streaming_train_state_1000' #1000step warmup adam bs=32k lr=0.01
+    def shard_batch(batch, num_devices):
+        # Shard each tensor along the first axis
+        sharded = {k: np.array_split(v, num_devices) for k, v in batch.items()}
+        # Group the shards for each device into a list of dictionaries
+        return [{k: sharded[k][i] for k in batch} for i in range(num_devices)]
+
+    # FLAGS.load_checkpoint = 'trainstate_params::/n/holyscratch01/barak_lab/Users/nabreu/SOO-LM/checkpoint/47578767/streaming_train_state_1000' #1000step warmup adam bs=32k lr=0.01
+    
+    # jax.profiler.start_trace("tensorboard-base")
     mesh = LLaMAConfigurator.get_jax_mesh(FLAGS.mesh_dim)
+    print(f"Mesh axes names: {mesh.axis_names}")
+    print(f"Mesh shape: {mesh.shape}")
+
     with mesh:
+        print(mesh)
         train_state, restored_params = None, None
         if FLAGS.load_checkpoint != '':
             train_state, restored_params = checkpointer.load_trainstate_checkpoint(
@@ -418,10 +557,29 @@ def main(argv):
 
         step_counter = trange(start_step, FLAGS.total_steps, ncols=0)
 
+        assert FLAGS.train_dataset_batch_size % mesh.shape['dp'] == 0, \
+            "Batch size must be divisible by the number of devices in 'dp'."
+        
+        if FLAGS.weight_average:
+            print('Using weight average')
+            ema = train_state.params
+
         for step, (batch, dataset_metrics) in zip(step_counter, dataset):
+
+            batch = jax.tree_map(
+                lambda x: jax.lax.with_sharding_constraint(x, PS(('dp', 'fsdp'))),
+                batch
+            )
+
             train_state, sharded_rng, metrics = sharded_train_step(
                 train_state, sharded_rng, batch
             )
+
+            if FLAGS.weight_average:
+                alpha = FLAGS.weight_average_decay
+                ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, train_state.params)
+
+            
 
             if step % FLAGS.log_freq == 0:
                 log_metrics = {"step": step}
@@ -431,11 +589,17 @@ def main(argv):
 
                 if FLAGS.eval_freq != 0 and FLAGS.eval_steps > 0: # eval_freq must be | by log_freq
                     if step % FLAGS.eval_freq == 0:
+                        eval_iterator = iter(eval_dataset)
                         eval_metric_list = []
                         for _ in range(FLAGS.eval_steps):
                             eval_batch, _ = next(eval_iterator)
+
+                            if FLAGS.weight_average:
+                                eval_params=ema
+                            else:
+                                eval_params = train_state.params
                             sharded_rng, eval_metrics = sharded_eval_step(
-                                train_state, sharded_rng, eval_batch
+                                eval_params, sharded_rng, eval_batch
                             )
                             eval_metric_list.append(eval_metrics)
                         log_metrics.update(average_metrics(eval_metric_list))
@@ -453,24 +617,31 @@ def main(argv):
             elif FLAGS.save_model_freq > 0 and (step + 1) % FLAGS.save_model_freq == 0:
                 save_checkpoint(train_state)
 
-        if FLAGS.eval_freq != 0:
-            log_metrics = {"step": step}
+        if FLAGS.eval_freq != 0 and FLAGS.eval_steps > 0: # eval_freq must be | by log_freq
+            eval_iterator = iter(eval_dataset)
             eval_metric_list = []
             for _ in range(FLAGS.eval_steps):
                 eval_batch, _ = next(eval_iterator)
+
+                if FLAGS.weight_average:
+                    eval_params=ema
+                else:
+                    eval_params = train_state.params
                 sharded_rng, eval_metrics = sharded_eval_step(
-                    train_state, sharded_rng, eval_batch
+                    eval_params, sharded_rng, eval_batch
                 )
                 eval_metric_list.append(eval_metrics)
             log_metrics.update(average_metrics(eval_metric_list))
- 
             log_metrics = jax.device_get(log_metrics)
             logger.log(log_metrics)
             tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
-
         if FLAGS.save_model_freq > 0:
             save_checkpoint(train_state)
 
+    # jax.profiler.stop_trace()
+
 
 if __name__ == "__main__":
+    print(jax.local_devices())
+    print(jax.devices())
     mlxu.run(main)
