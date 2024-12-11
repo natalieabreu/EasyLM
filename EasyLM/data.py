@@ -6,8 +6,11 @@ from multiprocessing import Pool
 
 import mlxu
 import numpy as np
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk, Dataset
 
+
+
+import os
 
 class DatasetFactory(object):
     """ Datset builder class. """
@@ -17,7 +20,7 @@ class DatasetFactory(object):
         config = mlxu.config_dict()
         config.type = 'huggingface'
         config.text_processor = TextProcessor.get_default_config()
-        config.huggingface_dataset = HuggingfaceDataset.get_default_config()
+        config.huggingface_dataset = OptHuggingfaceDataset.get_default_config()
         config.json_dataset = JsonDataset.get_default_config()
         return mlxu.update_config_dict(config, updates)
 
@@ -26,7 +29,7 @@ class DatasetFactory(object):
         config = cls.get_default_config(config)
         text_processor = TextProcessor(config.text_processor, tokenizer)
         if config.type == 'huggingface':
-            return HuggingfaceDataset(
+            return OptHuggingfaceDataset(
                 config.huggingface_dataset, tokenizer, text_processor, **kwargs
             )
         elif config.type == 'json':
@@ -139,6 +142,7 @@ class HuggingfaceDataset(object):
         config.batch_size = 8
         config.always_start_with_bos = False
         config.batch_token_dtype = 'i4'
+        config.tokens_count_at_start = 0
         return mlxu.update_config_dict(config, updates)
 
     def __init__(self, config, tokenizer, text_processor):
@@ -152,9 +156,11 @@ class HuggingfaceDataset(object):
             self.config.path, name, split=split, streaming=self.config.streaming
         )
 
+
     def __iter__(self):
         chunk_size = self.config.batch_size * self.config.seq_length
-        total_tokens = 0
+        total_tokens = self.config.tokens_count_at_start
+
         while True:
             token_buffer = []
             loss_mask_buffer = []
@@ -211,6 +217,374 @@ class HuggingfaceDataset(object):
     @property
     def vocab_size(self):
         return len(self._tokenizer)
+
+
+
+class OptHuggingfaceDataset(object):
+    """ Optimized Huggingface dataset that loads pre-tokenized data from disk. """
+
+    @staticmethod
+    def get_default_config(updates=None):
+        config = mlxu.config_dict()
+        config.pretokenized_dataset_dir = "/n/netscratch/kempner_barak_lab/Lab/nabreu/SOO-LM/tokenized"  # Directory of pre-tokenized dataset
+        config.seq_length = 1024
+        config.batch_size = 8
+        config.always_start_with_bos = False
+        config.batch_token_dtype = 'i4'
+        config.tokens_count_at_start = 0
+        config.throughput_average_window_size = 200
+
+        # not used
+        config.path = 'allenai/c4'
+        config.name = 'en'
+        config.split = 'train'
+        config.streaming = False
+        config.tokenizer_processes = 4  # Number of parallel processes
+        config.tokenizer_parallel_chunk_size = 32
+        config.tokenizer_parallel_batch_size = 1024
+
+        return mlxu.update_config_dict(config, updates)
+
+    @classmethod
+    def load_dataset(cls, config):
+        """
+        Loads the pre-tokenized dataset from disk.
+
+        Args:
+            config (dict): Configuration dictionary.
+
+        Returns:
+            datasets.Dataset or datasets.DatasetDict: Loaded dataset.
+        """
+        config = cls.get_default_config(config)
+        if not os.path.isdir(config.pretokenized_dataset_dir):
+            raise ValueError(f"Pre-tokenized dataset directory {config.pretokenized_dataset_dir} does not exist.")
+        dataset = load_from_disk(config.pretokenized_dataset_dir)
+        # dataset = Dataset.from_file("/n/home07/nabreu/SOO-LM/EasyLM/scratch/SOO-LM/tokenized/train/data-00000-of-05912.arrow")
+        return dataset
+
+    def __init__(self, config, tokenizer, text_processor):
+        """
+        Initializes the OptimizedHuggingfaceDataset.
+
+        Args:
+            config (dict): Configuration dictionary.
+        """
+        self.config = self.get_default_config(config)
+        if not hasattr(self, 'config'):
+            raise ValueError("Configuration is missing.")
+        
+        # TODO: move to flags
+        if self.config.split == 'validation':
+            self.config.pretokenized_dataset_dir = "/n/netscratch/kempner_barak_lab/Lab/nabreu/SOO-LM/tokenized-val"
+
+        self._dataset = self.load_dataset(self.config)
+        # dataset = Dataset.from_file("/n/home07/nabreu/SOO-LM/EasyLM/scratch/SOO-LM/tokenized/train/data-00000-of-05912.arrow")
+        self._seq_length = self.config.seq_length
+        self._batch_size = self.config.batch_size
+        self._always_start_with_bos = self.config.always_start_with_bos
+        self._batch_token_dtype = np.int32 if self.config.batch_token_dtype == 'i4' else np.int64
+        self._tokens_count_at_start = self.config.tokens_count_at_start
+        self._throughput_average_window_size = self.config.throughput_average_window_size
+
+        # Initialize variables for batching
+        self._chunk_size = self._batch_size * self._seq_length
+        self._token_buffer = []
+        self._loss_mask_buffer = []
+        self._step_times = []
+        self._start_time = time.time()
+        self._total_tokens = self._tokens_count_at_start
+
+        # Define BOS token ID if needed
+        if self._always_start_with_bos:
+            # Assuming you have access to the tokenizer's BOS token ID
+            self._bos_token_id = tokenizer.bos_token_id
+            if self._bos_token_id is None:
+                raise ValueError("Tokenizer does not have a BOS token ID.")
+        
+        # If dataset is a DatasetDict, select the appropriate split
+        if isinstance(self._dataset, dict):
+            # Assuming 'train' split; modify if necessary
+            self._dataset = self._dataset['train']
+
+    def __iter__(self):
+        """
+        Iterator over the dataset that yields batches.
+
+        Yields:
+            tuple: (batch_dict, metrics_dict)
+        """
+        tokens_to_skip = self._tokens_count_at_start
+        self._total_tokens = self._tokens_count_at_start  # Initialize total tokens
+
+        # Iterator over the dataset
+        dataset_iterator = iter(self._dataset)
+
+        # Step 1: Skip tokens up to tokens_count_at_start
+        while tokens_to_skip > 0:
+            try:
+                example = next(dataset_iterator)
+            except StopIteration:
+                # End of dataset reached before skipping desired tokens
+                print("Reached end of dataset while skipping tokens.")
+                return
+
+            tokens = example['input_tokens']
+            loss_masks = example['loss_masks']
+            num_tokens = len(tokens)
+
+            if tokens_to_skip >= num_tokens:
+                # Skip the entire example
+                tokens_to_skip -= num_tokens
+                continue
+            else:
+                # Skip part of the example
+                tokens = tokens[tokens_to_skip:]
+                loss_masks = loss_masks[tokens_to_skip:]
+                self._total_tokens += len(tokens)
+                tokens_to_skip = 0  # All required tokens have been skipped
+
+                # Add the remaining tokens to the buffer
+                self._token_buffer.extend(tokens)
+                self._loss_mask_buffer.extend(loss_masks)
+
+        # Step 2: Continue iterating over the dataset and yielding batches
+        for example in dataset_iterator:
+            tokens = example['input_tokens']
+            loss_masks = example['loss_masks']
+
+            self._token_buffer.extend(tokens)
+            self._loss_mask_buffer.extend(loss_masks)
+
+            while len(self._token_buffer) > self._chunk_size + 1:
+                # Prepare batch
+                input_tokens = np.array(
+                    self._token_buffer[:self._chunk_size],
+                    dtype=self._batch_token_dtype
+                ).reshape(self._batch_size, self._seq_length)
+
+                target_tokens = np.array(
+                    self._token_buffer[1:self._chunk_size + 1],
+                    dtype=self._batch_token_dtype
+                ).reshape(self._batch_size, self._seq_length)
+
+                loss_masks = np.array(
+                    self._loss_mask_buffer[1:self._chunk_size + 1],
+                    dtype=np.float32
+                ).reshape(self._batch_size, self._seq_length)
+
+                if self._always_start_with_bos:
+                    # Replace the first token with BOS token ID
+                    input_tokens[:, 0] = self._bos_token_id
+
+                # Yield the batch and metrics
+                metrics = {
+                    'dataset_total_tokens': self._total_tokens + self._chunk_size,
+                }
+
+                batch = {
+                    'input_tokens': input_tokens,
+                    'target_tokens': target_tokens,
+                    'loss_masks': loss_masks,
+                }
+
+                yield batch, metrics
+
+                # Update total tokens and remove the yielded tokens from the buffer
+                self._total_tokens += self._chunk_size
+                self._token_buffer = self._token_buffer[self._chunk_size:]
+                self._loss_mask_buffer = self._loss_mask_buffer[self._chunk_size:]
+
+    def get_state_dict(self):
+        return {
+            'config': self.config,
+            'tokens_count_at_start': self._total_tokens,  # Save the current token count
+        }
+
+    def load_state_dict(self, state_dict):
+        if 'config' in state_dict:
+            self.config.update(mlxu.ConfigDict(state_dict['config']))
+        self._tokens_count_at_start = state_dict.get('tokens_count_at_start', self.config.tokens_count_at_start)
+        self._total_tokens = self._tokens_count_at_start  # Ensure consistency
+
+    @property
+    def seq_length(self):
+        return self._seq_length
+
+    @property
+    def tokenizer(self):
+        return None  # Not used in the optimized version
+
+    @property
+    def text_processor(self):
+        return None  # Not used in the optimized version
+
+    @property
+    def dataset(self):
+        return self._dataset
+
+    @property
+    def vocab_size(self):
+        return self._dataset.features['input_tokens'].feature.dtype.size
+
+
+# class OptHuggingfaceDataset(object):
+#     """ Optimized Huggingface dataset that loads pre-tokenized data from disk. """
+
+#     @staticmethod
+#     def get_default_config(updates=None):
+#         config = mlxu.config_dict()
+#         config.pretokenized_dataset_dir = "/n/netscratch/kempner_barak_lab/Lab/nabreu/SOO-LM/tokenized"  # Directory of pre-tokenized dataset
+#         config.seq_length = 1024
+#         config.batch_size = 8
+#         config.always_start_with_bos = False
+#         config.batch_token_dtype = 'i4'
+#         config.tokens_count_at_start = 0
+#         config.throughput_average_window_size = 200
+        
+        
+
+#         # not used
+#         config.path = 'allenai/c4'
+#         config.name = 'en'
+#         config.split = 'train'
+#         config.streaming = False
+#         config.tokenizer_processes = 4  # Number of parallel processes
+#         config.tokenizer_parallel_chunk_size = 32
+#         config.tokenizer_parallel_batch_size = 1024
+
+#         return mlxu.update_config_dict(config, updates)
+
+#     @classmethod
+#     def load_dataset(cls, config):
+#         """
+#         Loads the pre-tokenized dataset from disk.
+
+#         Args:
+#             config (dict): Configuration dictionary.
+
+#         Returns:
+#             datasets.Dataset or datasets.DatasetDict: Loaded dataset.
+#         """
+#         config = cls.get_default_config(config)
+#         if not os.path.isdir(config.pretokenized_dataset_dir):
+#             raise ValueError(f"Pre-tokenized dataset directory {config.pretokenized_dataset_dir} does not exist.")
+#         dataset = load_from_disk(config.pretokenized_dataset_dir)
+#         # dataset = Dataset.from_file("/n/home07/nabreu/SOO-LM/EasyLM/scratch/SOO-LM/tokenized/train/data-00000-of-05912.arrow")
+#         return dataset
+
+#     def __init__(self, config, tokenizer, text_processor):
+#         """
+#         Initializes the OptimizedHuggingfaceDataset.
+
+#         Args:
+#             config (dict): Configuration dictionary.
+#         """
+#         self.config = self.get_default_config(config)
+#         if not hasattr(self, 'config'):
+#             raise ValueError("Configuration is missing.")
+        
+#         # TODO: move to flags
+#         if self.config.split == 'validation':
+#             self.config.pretokenized_dataset_dir = "/n/netscratch/kempner_barak_lab/Lab/nabreu/SOO-LM/tokenized-val"
+
+#         self._dataset = self.load_dataset(self.config)
+#         self._seq_length = self.config.seq_length
+#         self._batch_size = self.config.batch_size
+#         self._always_start_with_bos = self.config.always_start_with_bos
+#         self._batch_token_dtype = np.int32 if self.config.batch_token_dtype == 'i4' else np.int64
+#         self._tokens_count_at_start = self.config.tokens_count_at_start
+#         self._throughput_average_window_size = self.config.throughput_average_window_size
+
+#         # Initialize variables for batching
+#         self._chunk_size = self._batch_size * self._seq_length
+#         self._token_buffer = []
+#         self._loss_mask_buffer = []
+#         self._step_times = []
+#         self._start_time = time.time()
+#         self._total_tokens = self._tokens_count_at_start
+
+#         # If dataset is a DatasetDict, select the appropriate split
+#         if isinstance(self._dataset, dict):
+#             # Assuming 'train' split; modify if necessary
+#             self._dataset = self._dataset['train']
+
+#     def __iter__(self):
+#         """
+#         Iterator over the dataset that yields batches.
+
+#         Yields:
+#             tuple: (batch_dict, metrics_dict)
+#         """
+#         for example in self._dataset: # TODO: Start from self._tokens_count_at_start
+#             tokens = example['input_tokens']
+#             loss_masks = example['loss_masks']
+
+#             self._token_buffer.extend(tokens)
+#             self._loss_mask_buffer.extend(loss_masks)
+
+#             while len(self._token_buffer) > self._chunk_size + 1:
+#                 self._total_tokens += self._chunk_size
+#                 metrics = {
+#                     'dataset_total_tokens': self._total_tokens,
+#                 }
+
+#                 input_tokens = np.array(self._token_buffer[:self._chunk_size], dtype=self._batch_token_dtype).reshape(
+#                     self._batch_size, self._seq_length
+#                 )
+#                 target_tokens = np.array(self._token_buffer[1:self._chunk_size + 1], dtype=self._batch_token_dtype).reshape(
+#                     self._batch_size, self._seq_length
+#                 )
+#                 loss_masks = np.array(self._loss_mask_buffer[1:self._chunk_size + 1], dtype=np.float32).reshape(
+#                     self._batch_size, self._seq_length
+#                 )
+
+#                 if self._always_start_with_bos:
+#                     # Assuming BOS token ID is the first token in input_tokens
+#                     input_tokens[:, 0] = self._dataset.features['input_tokens'].feature.int2str(
+#                         self._dataset.features['input_tokens'].feature.dtype
+#                     ).bos_token_id
+
+#                 batch = {
+#                     'input_tokens': input_tokens,
+#                     'target_tokens': target_tokens,
+#                     'loss_masks': loss_masks,
+#                 }
+
+#                 yield batch, metrics
+
+#                 # Remove the chunk from the buffer
+#                 self._token_buffer = self._token_buffer[self._chunk_size:]
+#                 self._loss_mask_buffer = self._loss_mask_buffer[self._chunk_size:]
+
+#     def get_state_dict(self):
+#         return dict(config=self.config)
+
+#     def load_state_dict(self, state_dict):
+#         if 'config' in state_dict:
+#             self.config.update(mlxu.ConfigDict(state_dict['config']))
+#         self._tokens_count_at_start = state_dict.get('tokens_count_at_start', self.config.tokens_count_at_start)
+
+#     @property
+#     def seq_length(self):
+#         return self._seq_length
+
+#     @property
+#     def tokenizer(self):
+#         return None  # Not used in the optimized version
+
+#     @property
+#     def text_processor(self):
+#         return None  # Not used in the optimized version
+
+#     @property
+#     def dataset(self):
+#         return self._dataset
+
+#     @property
+#     def vocab_size(self):
+#         return self._dataset.features['input_tokens'].feature.dtype.size
+
 
 
 class JsonDataset(object):
