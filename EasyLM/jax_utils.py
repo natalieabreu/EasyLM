@@ -19,6 +19,11 @@ from jax.interpreters import pxla
 import numpy as np
 from transformers import FlaxLogitsWarper
 
+import subprocess as sp
+import psutil
+import tracemalloc
+import linecache
+
 
 class JaxRNG(object):
     """ A convenient stateful Jax RNG wrapper. Can be used to wrap RNG inside
@@ -295,6 +300,8 @@ def cross_entropy_loss_and_accuracy_with_weight_decay(logits, tokens, new_params
       return alpha * (x ** 2).mean()
   
     param_diff = jax.tree_util.tree_map(lambda x, y: x - y, new_params, old_params)
+
+    base_loss = loss
     loss += sum(
         l2_loss(w, weight_decay) 
         for w in jax.tree.leaves(param_diff)
@@ -308,7 +315,7 @@ def cross_entropy_loss_and_accuracy_with_weight_decay(logits, tokens, new_params
         jnp.array(False)
     )
     accuracy = jnp.mean(jnp.sum(correct, axis=-1) / valid_text_length)
-    return loss, accuracy
+    return loss, (accuracy, base_loss)
 
 
 def global_norm(tree):
@@ -436,3 +443,60 @@ def tree_apply(fns, tree):
     """ Apply a pytree of functions to the pytree. """
     return jax.tree_util.tree_map(lambda fn, x: fn(x), fns, tree)
 
+
+# NA: Added util fns
+
+def display_top(snapshot, key_type='lineno', limit=10):
+    snapshot = snapshot.filter_traces((
+        tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
+        tracemalloc.Filter(False, "<unknown>"),
+    ))
+    top_stats = snapshot.statistics(key_type)
+
+    print("Top %s lines" % limit)
+    for index, stat in enumerate(top_stats[:limit], 1):
+        frame = stat.traceback[0]
+        print("#%s: %s:%s: %.1f KiB"
+              % (index, frame.filename, frame.lineno, stat.size / 1024))
+        line = linecache.getline(frame.filename, frame.lineno).strip()
+        if line:
+            print('    %s' % line)
+
+    other = top_stats[limit:]
+    if other:
+        size = sum(stat.size for stat in other)
+        print("%s other: %.1f KiB" % (len(other), size / 1024))
+    total = sum(stat.size for stat in top_stats)
+    print("Total allocated size: %.1f KiB" % (total / 1024), flush=True)
+
+def get_gpu_memory():
+    command = "nvidia-smi --query-gpu=memory.free --format=csv"
+    memory_free_info = sp.check_output(command.split()).decode('ascii').split('\n')[:-1][1:]
+    memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
+    return memory_free_values
+
+def is_embedding_param(param_name, param_value):
+    if 'embedding' in param_name:
+        return True
+    return False
+
+def count_params(params):
+    non_embedding_count = 0
+    total_count = 0
+
+    for param_name, param_value in jax.tree_util.tree_leaves_with_path(params):
+        # print(param_name[-1].key, is_embedding_param(param_name[-1].key, param_value), jnp.prod(jnp.array(param_value.size)))
+        total_count += jnp.prod(jnp.array(param_value.size))
+        if not is_embedding_param(param_name[-1].key, param_value):
+            non_embedding_count += jnp.prod(jnp.array(param_value.size))
+            print(param_name[-5:], is_embedding_param(param_name[-1].key, param_value), jnp.prod(jnp.array(param_value.size)))
+        else:
+            print(param_name, is_embedding_param(param_name[-1].key, param_value), jnp.prod(jnp.array(param_value.size)))
+    # print(non_embedding_count)
+    return total_count, non_embedding_count
+
+def get_ram():
+    return psutil.virtual_memory().available * 100 / psutil.virtual_memory().total
+
+def print_shape(pytree, prefix=''):
+    print(prefix, jax.tree_util.tree_map(lambda x: x.shape, pytree))

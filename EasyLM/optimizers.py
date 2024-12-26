@@ -124,6 +124,7 @@ class AdamWOptimizerFactory(object):
     @staticmethod
     def get_default_config(updates=None):
         config = ConfigDict()
+        config.lr_sched = 'cosine'
         config.init_lr = 0.0
         config.end_lr = 0.001
         config.lr = 0.01
@@ -144,14 +145,19 @@ class AdamWOptimizerFactory(object):
     def get_optimizer(cls, config, weight_decay_mask=None):
         config = cls.get_default_config(config)
 
-        learning_rate_schedule = optax.warmup_cosine_decay_schedule(
-            init_value=config.init_lr,
-            peak_value=config.lr,
-            warmup_steps=config.lr_warmup_steps,
-            decay_steps=config.lr_decay_steps,
-            end_value=config.end_lr,
-        )
-
+        if config.lr_sched == 'cosine':
+            learning_rate_schedule = optax.warmup_cosine_decay_schedule(
+                init_value=config.init_lr,
+                peak_value=config.lr,
+                warmup_steps=config.lr_warmup_steps,
+                decay_steps=config.lr_decay_steps,
+                end_value=config.end_lr,
+            )
+        elif config.lr_sched == 'constant':
+            learning_rate_schedule = optax.constant_schedule(config.lr)
+        else:
+            raise ValueError(f'Unknown inner loop schedule: {config.inner_loop_sched}')
+        
         optimizer_info = dict(
             learning_rate_schedule=learning_rate_schedule,
         )

@@ -66,7 +66,7 @@ class StreamingCheckpointer(object):
             path = '/dev/null'
         mlxu.save_pickle(obj, path)
 
-    def save_all(self, train_state, gather_fns, metadata=None, dataset=None, milestone=False):
+    def save_all(self, train_state, gather_fns, ema=None, metadata=None, dataset=None, milestone=False):
         step = int(jax.device_get(train_state.step))
         if self.config.save_optimizer_state:
             checkpoint_state = train_state
@@ -91,6 +91,9 @@ class StreamingCheckpointer(object):
             self.save_checkpoint(
                 checkpoint_state, f'{checkpoint_name}', checkpoint_gather_fns
             )
+
+        if ema:
+            self.save_checkpoint(ema['params'], 'streaming_ema_params', gather_fns.params['params'])
 
     @staticmethod
     def load_checkpoint(path, target=None, shard_fns=None, remove_dict_prefix=None):

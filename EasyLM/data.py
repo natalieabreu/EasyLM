@@ -226,7 +226,7 @@ class OptHuggingfaceDataset(object):
     @staticmethod
     def get_default_config(updates=None):
         config = mlxu.config_dict()
-        config.pretokenized_dataset_dir = "/n/netscratch/kempner_barak_lab/Lab/nabreu/SOO-LM/tokenized"  # Directory of pre-tokenized dataset
+        config.pretokenized_dataset_dir = ''  # Directory of pre-tokenized dataset
         config.seq_length = 1024
         config.batch_size = 8
         config.always_start_with_bos = False
@@ -259,9 +259,15 @@ class OptHuggingfaceDataset(object):
         config = cls.get_default_config(config)
         if not os.path.isdir(config.pretokenized_dataset_dir):
             raise ValueError(f"Pre-tokenized dataset directory {config.pretokenized_dataset_dir} does not exist.")
+        print(f'Loading {config.split} dataset from {config.pretokenized_dataset_dir}...')
         dataset = load_from_disk(config.pretokenized_dataset_dir)
-        # dataset = Dataset.from_file("/n/home07/nabreu/SOO-LM/EasyLM/scratch/SOO-LM/tokenized/train/data-00000-of-05912.arrow")
         return dataset
+    
+    def set_start_tokens(self, tokens):
+        print(f'Dataset: setting start tokens to {tokens}')
+        self.config.tokens_count_at_start = tokens
+        self._tokens_count_at_start = tokens
+        self._total_tokens = tokens
 
     def __init__(self, config, tokenizer, text_processor):
         """
@@ -274,10 +280,6 @@ class OptHuggingfaceDataset(object):
         if not hasattr(self, 'config'):
             raise ValueError("Configuration is missing.")
         
-        # TODO: move to flags
-        if self.config.split == 'validation':
-            self.config.pretokenized_dataset_dir = "/n/netscratch/kempner_barak_lab/Lab/nabreu/SOO-LM/tokenized-val"
-
         self._dataset = self.load_dataset(self.config)
         # dataset = Dataset.from_file("/n/home07/nabreu/SOO-LM/EasyLM/scratch/SOO-LM/tokenized/train/data-00000-of-05912.arrow")
         self._seq_length = self.config.seq_length
