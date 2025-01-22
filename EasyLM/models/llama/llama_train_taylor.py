@@ -428,13 +428,14 @@ def main(argv):
         start_step = 0
         ema = None
         opt_state = None
-        # Generate dummy data
+
         train_state, restored_params = None, None
         if FLAGS.load_checkpoint != '':
             train_state, restored_params = checkpointer.load_trainstate_checkpoint(
                 FLAGS.load_checkpoint, train_state_shapes, shard_fns
             )
-            if train_state is not None: # distinguish between loading from train_state and loading from params
+            # distinguish between loading from train_state and loading from params
+            if train_state is not None and output_dir in FLAGS.load_checkpoint: # need to distinguish between loading adam initial ckpt and taylor mid-run ckpt
                 start_step = int(jax.device_get(train_state.step))
                 start_tokens = int(jax.device_get(train_state.step)) * FLAGS.inner_loop_iter * batch_size * seq_length + FLAGS.train_dataset.huggingface_dataset.tokens_count_at_start
                 dataset.set_start_tokens(start_tokens)
@@ -445,6 +446,7 @@ def main(argv):
                     FLAGS.load_ema_checkpoint, train_state_shapes, shard_fns
                 )
 
+            if train_state is not None: # do this in both cases
                 opt_state = train_state.opt_state
 
         if train_state is None and restored_params is None:
