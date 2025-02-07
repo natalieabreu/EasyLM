@@ -1,6 +1,8 @@
 import pprint
 from functools import partial
 
+from google.cloud import storage
+
 from tqdm import tqdm, trange
 import numpy as np
 import mlxu
@@ -62,7 +64,8 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     log_all_worker=False,
     jax_distributed=JaxDistributedConfig.get_default_config(),
     start_step=0,
-    experiment_id=0
+    experiment_id=0,
+    gc_bucket=''
 )
 
 def get_gpu_memory():
@@ -91,6 +94,15 @@ def count_params(params):
     # print(non_embedding_count)
     return total_count, non_embedding_count
 
+def load_from_gcp(bucket, checkpoint_path, local_path='/tmp/model.ckpt'):
+    if bucket == '':
+        raise ValueError("GCP bucket not specified.")
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket)
+    blob = bucket.blob(checkpoint_path)
+    blob.download_to_filename(local_path)
+    print(f"Checkpoint downloaded to {local_path}")
+
 
 def main(argv):
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
@@ -104,6 +116,9 @@ def main(argv):
     set_random_seed(FLAGS.seed)
 
     print(FLAGS.train_dataset)
+
+    if FLAGS.gc_bucket != '':
+        FLAGS.load_checkpoint = load_from_gcp(FLAGS.gcp_bucket, FLAGS.load_checkpoint)
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
