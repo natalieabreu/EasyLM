@@ -7,10 +7,13 @@ def parse_sweep_arguments(args):
     sweep_flags = {}
     static_flags = []
     program = None
+    resume_from=None
     
     for arg in args:
         if arg.startswith('--program='):
             program = arg.split('=')[1]
+        elif arg.startswith('--resume_from='):
+            resume_from = arg.split('=')[1]
         elif '=' in arg and '&' in arg:
             key, values = arg.split('=')
             values = values.strip('\'"')
@@ -22,7 +25,7 @@ def parse_sweep_arguments(args):
     if not program:
         raise ValueError("Program not specified. Use --program=<program_name> to specify the program.")
     
-    return program, sweep_flags, static_flags
+    return program, resume_from, sweep_flags, static_flags
 
 def generate_combinations(sweep_flags):
     if not sweep_flags:
@@ -90,10 +93,20 @@ def get_latest_checkpoint(directory_path):
 
 def main():
     args = sys.argv[1:]
+
+    program, resume_from, sweep_flags, static_flags = parse_sweep_arguments(args)
+
+    if resume_from:
+        job_id = resume_from
+        print(f"Resuming from job_id: {job_id}")
+    else:
+        job_id = os.getenv('SLURM_ARRAY_JOB_ID', '0')
+
+    # Assumes index will be the same if resuming
     job_index = int(os.getenv('SLURM_ARRAY_TASK_ID', '0')) - 1
-    job_id = os.getenv('SLURM_JOB_ID', '0')
-    
-    program, sweep_flags, static_flags = parse_sweep_arguments(args)
+    job_id = f"{job_id}_{job_index}"
+
+    static_flags = set_static_flag(static_flags, 'experiment_id', job_id)    
 
     combinations = generate_combinations(sweep_flags)
     config = select_configuration(combinations, job_index)

@@ -62,6 +62,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     log_all_worker=False,
     jax_distributed=JaxDistributedConfig.get_default_config(),
     start_step=0,
+    experiment_id=0
 )
 
 def get_gpu_memory():
@@ -126,6 +127,12 @@ def main(argv):
 
     optimizer, optimizer_info = OptimizerFactory.get_optimizer(FLAGS.optimizer)
 
+    # print(hasattr(FLAGS.optimizer, 'soap_optimizer'))
+    # if hasattr(FLAGS.optimizer, 'soap_optimizer') and FLAGS.optimizer.soap_optimizer.lr_decay_steps != FLAGS.total_steps // (FLAGS.train_dataset_batch_size * FLAGS.optimizer.accumulate_gradient_steps):
+    #     raise ValueError("Remember to set decay_steps to total_steps // (batch_size * accumulate_gradient_steps)")
+    # elif hasattr(FLAGS.optimizer, 'adamw_optimizer') and FLAGS.optimizer.adamw_optimizer.lr_decay_steps != FLAGS.total_steps // (FLAGS.train_dataset_batch_size * FLAGS.optimizer.accumulate_gradient_steps):
+    #     raise ValueError("Remember to set decay_steps to total_steps // (batch_size * accumulate_gradient_steps)")
+    
     def create_trainstate_from_params(params):
         return TrainState.create(params=params, tx=optimizer, apply_fn=None)
 

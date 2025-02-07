@@ -11,6 +11,7 @@ import neural_tangents as nt
 
 import psutil
 import wandb
+import copy
 
 import jax
 import jax.numpy as jnp
@@ -87,6 +88,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     wandb_dir='/n/netscratch/kempner_barak_lab/Lab/nabreu/SOO-LM/experiment_output/open_llama_7b',
     output_dir='',
     notes='',
+    logger=mlxu.WandBLogger.get_default_config(),
     experiment_id='',
 
     weight_average=False,
@@ -401,7 +403,7 @@ def main(argv):
 
             def loss_and_accuracy_with_wd(params, old_params):
                 logits = f_tayl(
-                    params, batch['input_tokens'], deterministic=True,
+                    params, batch['input_tokens'], deterministic=False,
                     rngs=rng_generator(LLaMAConfigurator.rng_keys()),
                 ).logits
 
@@ -488,9 +490,12 @@ def main(argv):
 
         # global_step = 0  # To keep track of the global step for logging
 
+        def copy_array(x):
+            return copy.copy(x)  # or x.copy() if x is a NumPy/JAX array
+
         if FLAGS.weight_average and ema is None:
             print('Using weight average')
-            ema = params
+            ema = jax.tree_map(copy_array, params)
 
         # parallel_loss_fn = jax.pmap(loss_fn, axis_name='batch')
         parallel_loss_fn = jax.jit(loss_fn)
