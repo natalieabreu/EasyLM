@@ -118,7 +118,7 @@ def main(argv):
     print(FLAGS.train_dataset)
 
     if FLAGS.gc_bucket != '':
-        FLAGS.load_checkpoint = load_from_gcp(FLAGS.gcp_bucket, FLAGS.load_checkpoint)
+        FLAGS.load_checkpoint = load_from_gcp(FLAGS.gc_bucket, FLAGS.load_checkpoint)
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
