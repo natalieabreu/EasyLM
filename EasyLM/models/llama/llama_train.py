@@ -94,17 +94,53 @@ def count_params(params):
     # print(non_embedding_count)
     return total_count, non_embedding_count
 
-def load_from_gcp(bucket, checkpoint_path, local_path='/tmp/model.ckpt'):
+def load_from_gcp(bucket_name, gc_path, local_path):
+    """
+    Downloads a file or all files in a directory from a GCP bucket to a local path.
+
+    Args:
+        bucket_name (str): Name of the GCP bucket.
+        gc_path (str): Path to a file or directory in the GCP bucket.
+        local_path (str): Path to the local file or directory where data will be saved.
+    """
+    if not bucket_name:
+        raise ValueError("GCP bucket not specified.")
+
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+
+    # Check if the given GCP path is a file or directory
+    blobs = list(bucket.list_blobs(prefix=gc_path))
+
+    if not blobs:
+        raise ValueError(f"No files found at {gc_path} in bucket {bucket_name}")
+
+    if len(blobs) == 1 and blobs[0].name == gc_path:  # Single file case
+        os.makedirs(os.path.dirname(local_path), exist_ok=True)
+        blobs[0].download_to_filename(local_path)
+        print(f"Downloaded {gc_path} to {local_path}")
+    else:  # Directory case
+        if not local_path.endswith('/'):
+            local_path += '/'  # Ensure local directory structure
+        os.makedirs(local_path, exist_ok=True)
+
+        for blob in blobs:
+            if not blob.name.endswith('/'):  # Ignore "directory" markers
+                relative_path = blob.name[len(gc_path):].lstrip('/')  # Remove the prefix
+                local_file_path = os.path.join(local_path, relative_path)
+                os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
+                blob.download_to_filename(local_file_path)
+                print(f"Downloaded {blob.name} to {local_file_path}")
+
+    print("Download complete.")
+
+def load_ckpt_from_gcp(bucket, checkpoint_path, local_path='/tmp/model.ckpt'):
     if bucket == '':
         raise ValueError("GCP bucket not specified.")
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket)
     ckpt_type, ckpt_path = checkpoint_path.split('::')
-    blob = bucket.blob(ckpt_path)
-    blob.download_to_filename(local_path)
+    local_path = load_from_gcp(bucket, ckpt_path, local_path)
     print(f"Checkpoint downloaded to {local_path}")
     return f'{ckpt_type}::/{local_path}'
-
 
 def main(argv):
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
@@ -120,7 +156,12 @@ def main(argv):
     print(FLAGS.train_dataset)
 
     if FLAGS.gc_bucket != '':
-        FLAGS.load_checkpoint = load_from_gcp(FLAGS.gc_bucket, FLAGS.load_checkpoint)
+        FLAGS.load_checkpoint = load_ckpt_from_gcp(FLAGS.gc_bucket, FLAGS.load_checkpoint)
+        if FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir != '':
+            FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcp(FLAGS.gc_bucket, FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir, '/tmp/eval_dataset')
+        if FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir != '':
+            FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcp(FLAGS.gc_bucket, FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, '/tmp/train_dataset')
+
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)

@@ -28,10 +28,12 @@ class DatasetFactory(object):
     def load_dataset(cls, config, tokenizer, **kwargs):
         config = cls.get_default_config(config)
         text_processor = TextProcessor(config.text_processor, tokenizer)
-        if config.type == 'huggingface':
+        if config.type == 'huggingface' and config.huggingface_dataset.pretokenized_dataset_dir != '':
             return OptHuggingfaceDataset(
                 config.huggingface_dataset, tokenizer, text_processor, **kwargs
             )
+        elif config.type == 'huggingface':
+            return HuggingfaceDataset(config.huggingface_dataset, tokenizer, text_processor, **kwargs)
         elif config.type == 'json':
             return JsonDataset(config.json_dataset, tokenizer, text_processor, **kwargs)
         else:

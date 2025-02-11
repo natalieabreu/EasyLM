@@ -23,6 +23,8 @@ from flax.training.train_state import TrainState
 from transformers import AutoTokenizer
 
 import optax
+from flax.traverse_util import flatten_dict, unflatten_dict
+
 
 import jax.profiler
 
@@ -76,6 +78,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     global_warmup=0.2,
     inner_loop_warmup=0.0,
 
+    optimizer_type='adamw',
     inner_b1=0.9,
     inner_b2=0.999,
     inner_clip_gradient=0.0,
@@ -193,31 +196,92 @@ def main(argv):
 
         return schedule
 
-    def build_optimizer(lr_sched, b1, b2, grad_clip=None, wd=0.0):
-        if grad_clip:
-            optimizer = optax.chain(
-                optax.clip_by_global_norm(grad_clip),
-                optax.adamw(
+    def build_optimizer(lr_sched, b1, b2, grad_clip=None, wd=0.0, optimizer_type='adamw'):
+        if optimizer_type == 'adamw':
+            if grad_clip:
+                optimizer = optax.chain(
+                    optax.clip_by_global_norm(grad_clip),
+                    optax.adamw(
+                        learning_rate=lr_sched,
+                        b1=b1,
+                        b2=b2,
+                        mu_dtype=jnp.float32,
+                        weight_decay=wd
+                    )
+                )
+            else:
+                optimizer = optax.adamw(
                     learning_rate=lr_sched,
                     b1=b1,
                     b2=b2,
                     mu_dtype=jnp.float32,
                     weight_decay=wd
                 )
+        elif optimizer_type == 'muon':
+            adamw_chain = optax.chain(
+                optax.clip_by_global_norm(grad_clip),
+                optax.adamw(
+                    learning_rate=lr_sched,
+                    weight_decay=wd,
+                    b1=b1,
+                    b2=b2,
+                    mu_dtype=jnp.float32,
+                ),
             )
-        else:
-            optimizer = optax.adamw(
-                learning_rate=lr_sched,
-                b1=b1,
-                b2=b2,
-                mu_dtype=jnp.float32,
-                weight_decay=wd
+
+            muon_chain = optax.chain(
+                optax.clip_by_global_norm(grad_clip),
+                optax.contrib.muon(
+                    learning_rate=lr_sched,
+                    adam_weight_decay=wd,
+                    adam_b1=b1,
+                    adam_b2=b2,
+                    mu_dtype=jnp.float32,
+                ),
             )
+
+            transform_dict = {
+                'adamw': adamw_chain,
+                'muon':   muon_chain,
+            }
+
+            def create_param_selector(params):
+                """
+                Return a pytree (same structure as params) whose leaves are strings
+                ('adamw' or 'muon'), AND print out the name of each parameter and its assignment.
+                """
+                # 1) Flatten the nested param dict so we get name tuples -> arrays
+                flat_params = flatten_dict(params, sep='.')
+
+                # Define first and last layer parameter names
+                first_layer_keys = ['params.transformer.wte.embedding']
+                last_layer_keys = ['params.lm_head.kernel']
+
+                # 2) Build the selector tree
+                flat_selector = {}
+                for name_tuple, param in flat_params.items():
+                    print(name_tuple)
+                    if name_tuple in first_layer_keys or name_tuple in last_layer_keys:
+                        print(f"Assigning param '{name_tuple}' (shape={param.shape}) to ADAMW.")
+                        flat_selector[name_tuple] = 'adamw'
+                    else:
+                        print(f"Assigning param '{name_tuple}' (shape={param.shape}) to MUON.")
+                        flat_selector[name_tuple] = 'muon'
+
+                # 3) Unflatten back to the original param-tree structure
+                selector_tree = unflatten_dict(flat_selector, sep='.')
+                return selector_tree
+
+        
+            def param_selector(params):
+                return create_param_selector(params)
+            
+            optimizer = optax.multi_transform(transform_dict, param_selector)
         return optimizer
 
     # optimizer, optimizer_info = OptimizerFactory.get_optimizer(FLAGS.optimizer)
     lr_sched = get_global_lr_sched(FLAGS.lr_sched, FLAGS.inner_loop_lr, FLAGS.total_steps, FLAGS.inner_loop_iter, FLAGS.global_warmup, FLAGS.inner_loop_warmup, FLAGS.end_lr)
-    tayl_solver = build_optimizer(lr_sched, FLAGS.inner_b1, FLAGS.inner_b2, FLAGS.inner_clip_gradient, FLAGS.optimizer_wd)
+    tayl_solver = build_optimizer(lr_sched, FLAGS.inner_b1, FLAGS.inner_b2, FLAGS.inner_clip_gradient, FLAGS.optimizer_wd, FLAGS.optimizer_type)
 
     def create_trainstate_from_params(params):
         return TrainState.create(params=params, tx=tayl_solver, apply_fn=None)
