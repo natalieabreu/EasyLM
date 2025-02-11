@@ -99,9 +99,11 @@ def load_from_gcp(bucket, checkpoint_path, local_path='/tmp/model.ckpt'):
         raise ValueError("GCP bucket not specified.")
     storage_client = storage.Client()
     bucket = storage_client.bucket(bucket)
-    blob = bucket.blob(checkpoint_path)
+    ckpt_type, ckpt_path = checkpoint_path.split('::')
+    blob = bucket.blob(ckpt_path)
     blob.download_to_filename(local_path)
     print(f"Checkpoint downloaded to {local_path}")
+    return f'{ckpt_type}::/{local_path}'
 
 
 def main(argv):
