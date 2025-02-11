@@ -112,6 +112,9 @@ def load_from_gcp(bucket_name, gc_path, local_path):
     # Check if the given GCP path is a file or directory
     blobs = list(bucket.list_blobs(prefix=gc_path))
 
+    print(gc_path)
+    print(blobs)
+
     if not blobs:
         raise ValueError(f"No files found at {gc_path} in bucket {bucket_name}")
 
@@ -133,6 +136,7 @@ def load_from_gcp(bucket_name, gc_path, local_path):
                 print(f"Downloaded {blob.name} to {local_file_path}")
 
     print("Download complete.")
+    return local_path
 
 def load_ckpt_from_gcp(bucket, checkpoint_path, local_path='/tmp/model.ckpt'):
     if bucket == '':
@@ -157,11 +161,11 @@ def main(argv):
 
     if FLAGS.gc_bucket != '':
         FLAGS.load_checkpoint = load_ckpt_from_gcp(FLAGS.gc_bucket, FLAGS.load_checkpoint)
-        if FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir != '':
-            FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcp(FLAGS.gc_bucket, FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir, '/tmp/eval_dataset')
         if FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir != '':
             FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcp(FLAGS.gc_bucket, FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, '/tmp/train_dataset')
-
+        if FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir != '':
+            FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcp(FLAGS.gc_bucket, FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir, '/tmp/eval_dataset')
+        
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
