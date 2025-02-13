@@ -71,6 +71,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     start_step=0,
     experiment_id='',
     gcs_num_train_files_to_download=300,
+    tmp_dir='/tmp',
 
     wandb_run_id='',
     wandb_project='',
@@ -128,16 +129,17 @@ def main(argv):
     init_checkpoint_path = FLAGS.load_checkpoint
 
     if FLAGS.load_checkpoint.split('::')[-1].startswith('gs://'):
-        FLAGS.load_checkpoint = load_ckpt_from_gcs(FLAGS.load_checkpoint)
+        FLAGS.load_checkpoint = load_ckpt_from_gcs(FLAGS.load_checkpoint, local_path=os.path.join(FLAGS.tmp_dir, 'model.ckpt'))
     if FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://'):
         num_to_download = FLAGS.gcs_num_train_files_to_download # Files download around 100 MiB/s
-        load_first_n_files_from_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'train'), '/tmp/train_dataset/train', num_to_download=num_to_download)
-        modify_dataset_info_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'train/dataset_info.json'), '/tmp/train_dataset/train', num_files_to_keep=num_to_download)
-        modify_state_json_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'train/state.json'), '/tmp/train_dataset/train', num_files_to_keep=num_to_download)
-        load_from_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'dataset_dict.json'), '/tmp/train_dataset/dataset_dict.json')
-        FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir = '/tmp/train_dataset'
+        tmp_dir = FLAGS.tmp_dir
+        load_first_n_files_from_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'train'), os.path.join(tmp_dir, 'train_dataset/train'), num_to_download=num_to_download)
+        modify_dataset_info_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'train/dataset_info.json'), os.path.join(tmp_dir, 'train_dataset/train'), num_files_to_keep=num_to_download)
+        modify_state_json_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'train/state.json'), os.path.join(tmp_dir, 'train_dataset/train'), num_files_to_keep=num_to_download)
+        load_from_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'dataset_dict.json'), os.path.join(tmp_dir, 'train_dataset/dataset_dict.json'))
+        FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir = os.path.join(tmp_dir, 'train_dataset')
     if FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://'):
-        FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcs(FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir, '/tmp/eval_dataset')
+        FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcs(FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir, os.path.join(FLAGS.tmp_dir,'eval_dataset'))
         
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
@@ -614,7 +616,7 @@ def main(argv):
                 os.makedirs(output_dir)
 
             # Save wandb_id.txt locally first
-            local_path = os.path.join(output_dir if not is_gcs else "/tmp", "wandb_id.txt")
+            local_path = os.path.join(output_dir if not is_gcs else FLAGS.tmp_dir, "wandb_id.txt")
 
             with open(local_path, 'w+') as f:
                 f.write(wandb.run.id)  # Hacky but easier than handling in train state loader
