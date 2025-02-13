@@ -33,7 +33,8 @@ class DatasetFactory(object):
                 config.huggingface_dataset, tokenizer, text_processor, **kwargs
             )
         elif config.type == 'huggingface':
-            return HuggingfaceDataset(config.huggingface_dataset, tokenizer, text_processor, **kwargs)
+            raise ValueError('Huggingface dataset is not supported in this version.')
+            # return HuggingfaceDataset(config.huggingface_dataset, tokenizer, text_processor, **kwargs)
         elif config.type == 'json':
             return JsonDataset(config.json_dataset, tokenizer, text_processor, **kwargs)
         else:
@@ -144,7 +145,8 @@ class HuggingfaceDataset(object):
         config.batch_size = 8
         config.always_start_with_bos = False
         config.batch_token_dtype = 'i4'
-        config.tokens_count_at_start = 0
+        config.tokens_count_at_start = 0        
+
         return mlxu.update_config_dict(config, updates)
 
     def __init__(self, config, tokenizer, text_processor):
@@ -158,15 +160,70 @@ class HuggingfaceDataset(object):
             self.config.path, name, split=split, streaming=self.config.streaming
         )
 
+        # if self.config.tokens_count_at_start > 0:
+        #     print(f"Skipping {self.config.tokens_count_at_start} tokens at the start of the dataset.", flush=True)
+        #     steps_to_skip = self.config.tokens_count_at_start // (self.config.seq_length * self.config.batch_size)
+        #     self._dataset = self._dataset.skip(steps_to_skip)
+        #     self.start_steps = steps_to_skip
+        #     print(f"Skipped {steps_to_skip} steps.", flush=True)
+
 
     def __iter__(self):
         chunk_size = self.config.batch_size * self.config.seq_length
         total_tokens = self.config.tokens_count_at_start
 
+        tokens_to_skip = self.config.tokens_count_at_start
+        # tokens_to_skip = 0
+
+        # Iterator over the dataset
+        dataset_iterator = iter(self._dataset)
+        
+
+        # # NA: Added this to skip tokens at the start for resuming mid training
+        # while tokens_to_skip > 0:
+        #     skip_token_buffer = []
+        #     skip_loss_mask_buffer = []
+        #     try:
+        #         example = next(dataset_iterator)
+        #     except StopIteration:
+        #         # End of dataset reached before skipping desired tokens
+        #         print("Reached end of dataset while skipping tokens.")
+        #         return
+            
+        #     start_steps = 0
+        #     while len(skip_token_buffer) < chunk_size + 1:
+        #         tokens, loss_masks = self.text_processor(example)
+        #         skip_token_buffer.extend(tokens)
+        #         skip_loss_mask_buffer.extend(loss_masks)
+
+            # while len(skip_token_buffer) > chunk_size + 1:
+            #     if tokens_to_skip <= 0:
+            #         break
+            
+            #     tokens = np.array(skip_token_buffer[:chunk_size], dtype=self.config.batch_token_dtype).reshape(
+            #                     self.config.batch_size, -1
+            #                 )
+            #     loss_masks = np.array(skip_loss_mask_buffer[1:chunk_size + 1], dtype=np.float32).reshape(
+            #                 self.config.batch_size, -1
+            #             ),
+            #     skip_token_buffer = skip_token_buffer[chunk_size:]
+            #     skip_loss_mask_buffer = skip_loss_mask_buffer[chunk_size:]
+
+            #     tokens_to_skip -= chunk_size
+            #     start_steps += 1
+      
+        # print(f"Created iterator; Starting from step {start_steps}.", flush=True)
         while True:
             token_buffer = []
             loss_mask_buffer = []
-            for index, example in enumerate(self._dataset):
+
+            # if len(skip_token_buffer) != 0: # NA: Resuming mid training
+            #     token_buffer.extend(skip_token_buffer)
+            #     loss_mask_buffer.extend(skip_loss_mask_buffer)
+            #     skip_token_buffer = []
+            #     skip_loss_mask_buffer = []
+
+            for index, example in enumerate(dataset_iterator):
                 tokens, loss_masks = self.text_processor(example)
                 token_buffer.extend(tokens)
                 loss_mask_buffer.extend(loss_masks)
@@ -199,6 +256,22 @@ class HuggingfaceDataset(object):
     def load_state_dict(self, state_dict):
         if 'config' in state_dict:
             self.config.update(mlxu.ConfigDict(state_dict['config']))
+
+    def set_start_tokens(self, tokens):
+        print(f'Dataset: setting start tokens to {tokens}')
+        tokens_skipped = self.config.tokens_count_at_start # Might already have skipped tokens, so need to skip the difference
+        self.config.tokens_count_at_start = tokens
+        self._tokens_count_at_start = tokens
+        self._total_tokens = tokens
+
+        # if tokens - tokens_skipped > 0:
+        #     print(f"Skipping {self.config.tokens_count_at_start} tokens at the start of the dataset.", flush=True)
+        #     steps_to_skip = (tokens - tokens_skipped) // (self.config.seq_length * self.config.batch_size)
+        #     self._dataset = self._dataset.skip(steps_to_skip)
+        #     self.start_steps += steps_to_skip
+        #     print(f"Skipped {self.start_steps} steps.", flush=True)
+
+
 
     @property
     def seq_length(self):
@@ -283,6 +356,7 @@ class OptHuggingfaceDataset(object):
             raise ValueError("Configuration is missing.")
         
         self._dataset = self.load_dataset(self.config)
+
         # dataset = Dataset.from_file("/n/home07/nabreu/SOO-LM/EasyLM/scratch/SOO-LM/tokenized/train/data-00000-of-05912.arrow")
         self._seq_length = self.config.seq_length
         self._batch_size = self.config.batch_size

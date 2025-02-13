@@ -2,6 +2,9 @@ import sys
 import itertools
 import os
 import re
+from google.cloud import storage
+
+from EasyLM.gcs_utils import gcs_path_exists, read_from_gcs
 
 def parse_sweep_arguments(args):
     sweep_flags = {}
@@ -91,6 +94,8 @@ def get_latest_checkpoint(directory_path):
     # Return the full path to the file
     return max_number, os.path.join(directory_path, max_file)
 
+
+
 def main():
     args = sys.argv[1:]
 
@@ -106,7 +111,8 @@ def main():
     job_index = int(os.getenv('SLURM_ARRAY_TASK_ID', '0')) - 1
     job_id = f"{job_id}_{job_index}"
 
-    static_flags = set_static_flag(static_flags, 'experiment_id', job_id)    
+    static_flags = set_static_flag(static_flags, 'experiment_id', job_id)  
+    print('set experiment id to', job_id)  
 
     combinations = generate_combinations(sweep_flags)
     config = select_configuration(combinations, job_index)
@@ -121,24 +127,39 @@ def main():
     # check if logger.output_dir + job_id exists and if so, set load_checkpoint to "trainstate::logger.output_dir + job_id"
     logger_output_dir = next((arg.split('=')[1] for arg in static_flags if arg.startswith('--output_dir=')), None)
 
+    print(logger_output_dir, flush=True)
     if logger_output_dir:
         checkpoint_path = os.path.join(logger_output_dir, job_id)
-        if os.path.exists(checkpoint_path):
-            # step, ckpt = get_latest_checkpoint(checkpoint_path)
+        is_gcs = checkpoint_path.startswith("gs://")
+
+        print(f"Checking for checkpoint at {checkpoint_path}", flush=True)
+        print(f"Is GCS: {is_gcs}", flush=True)
+        if is_gcs:
+            print('Path exists:', gcs_path_exists(checkpoint_path), flush=True)
+
+        # Check for existence based on storage type
+        if (is_gcs and gcs_path_exists(checkpoint_path)) or (not is_gcs and os.path.exists(checkpoint_path)):
+            print(f"Checkpoint exists: {checkpoint_path}", flush=True)
+       
             ckpt = os.path.join(checkpoint_path, "streaming_train_state")
 
-            if os.path.exists(ckpt):
+            if (is_gcs and gcs_path_exists(ckpt)) or (not is_gcs and os.path.exists(ckpt)):
                 print(f"Resuming from path: {ckpt}", flush=True)
                 static_flags = set_static_flag(static_flags, 'load_checkpoint', f"trainstate::{ckpt}")
 
-                if os.path.exists(os.path.join(checkpoint_path, "streaming_ema_params")):
+                ema_path = os.path.join(checkpoint_path, "streaming_ema_params")
+                if (is_gcs and gcs_path_exists(ema_path)) or (not is_gcs and os.path.exists(ema_path)):
                     print("Loading ema checkpoint")
                     static_flags = set_static_flag(static_flags, 'load_ema_checkpoint', f"params::{os.path.join(checkpoint_path, 'streaming_ema_params')}")
 
-                with open(f"{checkpoint_path}/wandb_id.txt", "r") as f:
-                    wandb_id = f.read().strip()
-                    print(f"Resuming from wandb_id: {wandb_id}")
-                    static_flags = set_static_flag(static_flags, 'wandb_run_id', wandb_id)
+                wandb_path = os.path.join(checkpoint_path, "wandb_id.txt")
+                if is_gcs:
+                    wandb_id = read_from_gcs(wandb_path)
+                else:
+                    with open(wandb_path, "r") as f:
+                        wandb_id = f.read().strip()
+                print(f"Resuming from wandb_id: {wandb_id}")
+                static_flags = set_static_flag(static_flags, 'wandb_run_id', wandb_id)
         
 
     print(static_flags)

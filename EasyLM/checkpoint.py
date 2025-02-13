@@ -11,6 +11,8 @@ from flax.serialization import (
 from flax.traverse_util import flatten_dict, unflatten_dict, empty_node
 import msgpack
 
+from google.cloud import storage
+
 from EasyLM.jax_utils import tree_apply, float_tensor_to_dtype
 
 
@@ -52,12 +54,41 @@ class StreamingCheckpointer(object):
         if gather_fns is not None:
             gather_fns = flatten_dict(to_state_dict(gather_fns))
 
-        with mlxu.open_file(path, "wb") as fout:
+        local_path = path
+        is_gcs = path.startswith("gs://")
+
+        # If saving to GCS, create a temporary file
+        if is_gcs:
+            import tempfile
+            tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".msgpack")
+            local_path = tmp_file.name
+
+        # Save the train state locally
+        with mlxu.open_file(local_path, "wb") as fout:
             for key, value in flattend_train_state.items():
                 if gather_fns is not None:
                     value = gather_fns[key](value)
                 value = float_tensor_to_dtype(value, float_dtype)
                 fout.write(packer.pack((key, to_bytes(value))))
+
+        # If the path is a GCS bucket, upload the file
+        if is_gcs:
+            StreamingCheckpointer.upload_to_gcs(local_path, path)
+
+    @staticmethod
+    def upload_to_gcs(local_path, gcs_path):
+        """Uploads a file to Google Cloud Storage."""
+        client = storage.Client()
+
+        # Extract bucket name and blob path
+        gcs_path_parts = gcs_path.replace("gs://", "").split("/", 1)
+        bucket_name = gcs_path_parts[0]
+        blob_path = gcs_path_parts[1]
+
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(blob_path)
+        blob.upload_from_filename(local_path)
+        print(f"File uploaded to {gcs_path}")
 
     def save_pickle(self, obj, filename):
         if self.enable:

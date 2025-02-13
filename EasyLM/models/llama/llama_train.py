@@ -11,6 +11,7 @@ import neural_tangents as nt
 
 import timeit
 import os
+import wandb
 
 import jax
 import jax.numpy as jnp
@@ -33,7 +34,11 @@ from EasyLM.jax_utils import (
 from EasyLM.models.llama.llama_model import (
     LLaMAConfigurator, FlaxLLaMAForCausalLMModule
 )
-
+from EasyLM.gcs_utils import (
+    load_ckpt_from_gcs, load_from_gcs, 
+    upload_to_gcs, load_first_n_files_from_gcs, 
+    modify_dataset_info_gcs, modify_state_json_gcs
+)
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     seed=42,
@@ -64,8 +69,13 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     log_all_worker=False,
     jax_distributed=JaxDistributedConfig.get_default_config(),
     start_step=0,
-    experiment_id=0,
-    gc_bucket=''
+    experiment_id='',
+
+    wandb_run_id='',
+    wandb_project='',
+    wandb_dir='/n/netscratch/kempner_barak_lab/Lab/nabreu/SOO-LM/experiment_output/open_llama_7b',
+    output_dir='',
+    notes='',
 )
 
 def get_gpu_memory():
@@ -94,77 +104,39 @@ def count_params(params):
     # print(non_embedding_count)
     return total_count, non_embedding_count
 
-def load_from_gcp(bucket_name, gc_path, local_path):
-    """
-    Downloads a file or all files in a directory from a GCP bucket to a local path.
 
-    Args:
-        bucket_name (str): Name of the GCP bucket.
-        gc_path (str): Path to a file or directory in the GCP bucket.
-        local_path (str): Path to the local file or directory where data will be saved.
-    """
-    if not bucket_name:
-        raise ValueError("GCP bucket not specified.")
-
-    storage_client = storage.Client()
-    bucket = storage_client.bucket(bucket_name)
-
-    # Check if the given GCP path is a file or directory
-    blobs = list(bucket.list_blobs(prefix=gc_path))
-
-    print(gc_path)
-    print(blobs)
-
-    if not blobs:
-        raise ValueError(f"No files found at {gc_path} in bucket {bucket_name}")
-
-    if len(blobs) == 1 and blobs[0].name == gc_path:  # Single file case
-        os.makedirs(os.path.dirname(local_path), exist_ok=True)
-        blobs[0].download_to_filename(local_path)
-        print(f"Downloaded {gc_path} to {local_path}")
-    else:  # Directory case
-        if not local_path.endswith('/'):
-            local_path += '/'  # Ensure local directory structure
-        os.makedirs(local_path, exist_ok=True)
-
-        for blob in blobs:
-            if not blob.name.endswith('/'):  # Ignore "directory" markers
-                relative_path = blob.name[len(gc_path):].lstrip('/')  # Remove the prefix
-                local_file_path = os.path.join(local_path, relative_path)
-                os.makedirs(os.path.dirname(local_file_path), exist_ok=True)
-                blob.download_to_filename(local_file_path)
-                print(f"Downloaded {blob.name} to {local_file_path}")
-
-    print("Download complete.")
-    return local_path
-
-def load_ckpt_from_gcp(bucket, checkpoint_path, local_path='/tmp/model.ckpt'):
-    if bucket == '':
-        raise ValueError("GCP bucket not specified.")
-    ckpt_type, ckpt_path = checkpoint_path.split('::')
-    local_path = load_from_gcp(bucket, ckpt_path, local_path)
-    print(f"Checkpoint downloaded to {local_path}")
-    return f'{ckpt_type}::/{local_path}'
 
 def main(argv):
     JaxDistributedConfig.initialize(FLAGS.jax_distributed)
+
+    output_dir = os.path.join(FLAGS.output_dir, FLAGS.experiment_id)
     variant = mlxu.get_user_flags(FLAGS, FLAGS_DEF)
     flags_config_dict = mlxu.user_flags_to_config_dict(FLAGS, FLAGS_DEF)
-    logger = mlxu.WandBLogger(
-        config=FLAGS.logger,
-        variant=variant,
-        enable=FLAGS.log_all_worker or (jax.process_index() == 0),
-    )
+
+    # FLAGS.logger.experiment_id = FLAGS.experiment_id # compatibility with taylor version
+    # logger = mlxu.WandBLogger(
+    #     config=FLAGS.logger,
+    #     variant=variant,
+    #     enable=FLAGS.log_all_worker or (jax.process_index() == 0),
+    # )
+    log_config = mlxu.flatten_config_dict(flags_config_dict)
+
     set_random_seed(FLAGS.seed)
 
     print(FLAGS.train_dataset)
 
-    if FLAGS.gc_bucket != '':
-        FLAGS.load_checkpoint = load_ckpt_from_gcp(FLAGS.gc_bucket, FLAGS.load_checkpoint)
-        if FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir != '':
-            FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcp(FLAGS.gc_bucket, FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, '/tmp/train_dataset')
-        if FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir != '':
-            FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcp(FLAGS.gc_bucket, FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir, '/tmp/eval_dataset')
+    if FLAGS.load_checkpoint.split('::')[-1].startswith('gs://'):
+        init_checkpoint_path = FLAGS.load_checkpoint
+        FLAGS.load_checkpoint = load_ckpt_from_gcs(FLAGS.load_checkpoint)
+    if FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://'):
+        num_to_download = 10
+        load_first_n_files_from_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'train'), '/tmp/train_dataset/train', num_to_download=num_to_download)
+        modify_dataset_info_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'train/dataset_info.json'), '/tmp/train_dataset/train', num_files_to_keep=num_to_download)
+        modify_state_json_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'train/state.json'), '/tmp/train_dataset/train', num_files_to_keep=num_to_download)
+        load_from_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'dataset_dict.json'), '/tmp/train_dataset/dataset_dict.json')
+        FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir = '/tmp/train_dataset'
+    if FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://'):
+        FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcs(FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir, '/tmp/eval_dataset')
         
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
@@ -532,7 +504,7 @@ def main(argv):
         train_state_partition, train_state_shapes
     )
     checkpointer = StreamingCheckpointer(
-        FLAGS.checkpointer, logger.output_dir,
+        FLAGS.checkpointer, output_dir,
         enable=jax.process_index() == 0,
     )
 
@@ -600,7 +572,21 @@ def main(argv):
             train_state, restored_params = checkpointer.load_trainstate_checkpoint(
                 FLAGS.load_checkpoint, train_state_shapes, shard_fns
             )
-            print('loaded checkpoint')
+            # distinguish between loading from train_state and loading from params
+            print('loaded checkpoint', FLAGS.load_checkpoint, flush=True)
+            print('output_dir:', output_dir)
+            print(output_dir in init_checkpoint_path, flush=True)
+            if train_state is not None and output_dir in init_checkpoint_path: # need to distinguish between loading adam initial ckpt and taylor mid-run ckpt
+                # dataset_path = os.path.join(output_dir, 'dataset.pkl')
+                # dataset.load_state_dict(mlxu.load_pickle(dataset_path))
+
+                # print('loaded dataset state', dataset_path, flush=True)
+                
+                start_step = int(jax.device_get(train_state.step))
+                start_tokens = int(jax.device_get(train_state.step)) * FLAGS.train_dataset_batch_size * seq_length + FLAGS.train_dataset.huggingface_dataset.tokens_count_at_start
+                dataset.set_start_tokens(start_tokens)
+                print('loaded checkpoint, starting at step', start_step, flush=True)
+                print('\tstart tokens:', start_tokens)
 
         if train_state is None and restored_params is None:
             # Initialize from scratch
@@ -614,8 +600,32 @@ def main(argv):
         param_count, param_count_nonembed = count_params(train_state.params)
         param_count = jax.device_get(param_count)
         param_count_nonembed = jax.device_get(param_count_nonembed)
-        logger.log({"param_count_nonembed": param_count_nonembed})
-        logger.log({"param_count": param_count})
+
+        flags_config_dict['param_count'] = param_count
+        flags_config_dict['param_count_nonembed'] = param_count_nonembed
+
+        if FLAGS.wandb_run_id:
+            wandb.init(entity='harvardml', project=FLAGS.wandb_project, resume="must", id=FLAGS.wandb_run_id, dir=FLAGS.wandb_dir)
+        else:
+            wandb.init(entity='harvardml', project=FLAGS.wandb_project, config=log_config, dir=FLAGS.wandb_dir)  # Replace with your project name
+
+            is_gcs = output_dir.startswith("gs://")
+
+            # If not GCS, create local directory
+            if not is_gcs and not os.path.exists(output_dir):
+                os.makedirs(output_dir)
+
+            # Save wandb_id.txt locally first
+            local_path = os.path.join(output_dir if not is_gcs else "/tmp", "wandb_id.txt")
+
+            with open(local_path, 'w+') as f:
+                f.write(wandb.run.id)  # Hacky but easier than handling in train state loader
+
+            # If output_dir is a GCS bucket, upload the file
+            if is_gcs:
+                gcs_path = os.path.join(output_dir, "wandb_id.txt")
+                upload_to_gcs(local_path, gcs_path)
+
 
         start_step = int(jax.device_get(train_state.step))
 
@@ -676,7 +686,7 @@ def main(argv):
                         # metrics = jax.device_get(metrics)
                         # logger.log(metrics)
                 log_metrics = jax.device_get(log_metrics)
-                logger.log(log_metrics)
+                wandb.log(log_metrics)
                 tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
             
             
@@ -684,6 +694,7 @@ def main(argv):
             if FLAGS.save_milestone_freq > 0 and (step + 1) % FLAGS.save_milestone_freq == 0:
                 save_checkpoint(train_state, milestone=True)
             elif FLAGS.save_model_freq > 0 and (step + 1) % FLAGS.save_model_freq == 0:
+                print('saving checkpoint', flush=True)
                 save_checkpoint(train_state)
 
         if FLAGS.eval_freq != 0 and FLAGS.eval_steps > 0: # eval_freq must be | by log_freq
@@ -702,12 +713,13 @@ def main(argv):
                 eval_metric_list.append(eval_metrics)
             log_metrics.update(average_metrics(eval_metric_list))
             log_metrics = jax.device_get(log_metrics)
-            logger.log(log_metrics)
+            wandb.log(log_metrics)
             tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
         if FLAGS.save_model_freq > 0:
             save_checkpoint(train_state)
 
     # jax.profiler.stop_trace()
+    wandb.finish()
 
 
 if __name__ == "__main__":
