@@ -70,6 +70,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     jax_distributed=JaxDistributedConfig.get_default_config(),
     start_step=0,
     experiment_id='',
+    gcs_num_train_files_to_download=300,
 
     wandb_run_id='',
     wandb_project='',
@@ -124,12 +125,12 @@ def main(argv):
     set_random_seed(FLAGS.seed)
 
     print(FLAGS.train_dataset)
+    init_checkpoint_path = FLAGS.load_checkpoint
 
     if FLAGS.load_checkpoint.split('::')[-1].startswith('gs://'):
-        init_checkpoint_path = FLAGS.load_checkpoint
         FLAGS.load_checkpoint = load_ckpt_from_gcs(FLAGS.load_checkpoint)
     if FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://'):
-        num_to_download = 10
+        num_to_download = FLAGS.gcs_num_train_files_to_download # Files download around 100 MiB/s
         load_first_n_files_from_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'train'), '/tmp/train_dataset/train', num_to_download=num_to_download)
         modify_dataset_info_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'train/dataset_info.json'), '/tmp/train_dataset/train', num_files_to_keep=num_to_download)
         modify_state_json_gcs(os.path.join(FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir, 'train/state.json'), '/tmp/train_dataset/train', num_files_to_keep=num_to_download)
@@ -573,9 +574,6 @@ def main(argv):
                 FLAGS.load_checkpoint, train_state_shapes, shard_fns
             )
             # distinguish between loading from train_state and loading from params
-            print('loaded checkpoint', FLAGS.load_checkpoint, flush=True)
-            print('output_dir:', output_dir)
-            print(output_dir in init_checkpoint_path, flush=True)
             if train_state is not None and output_dir in init_checkpoint_path: # need to distinguish between loading adam initial ckpt and taylor mid-run ckpt
                 # dataset_path = os.path.join(output_dir, 'dataset.pkl')
                 # dataset.load_state_dict(mlxu.load_pickle(dataset_path))
