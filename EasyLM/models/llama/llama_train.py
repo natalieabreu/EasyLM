@@ -146,6 +146,7 @@ def main(argv):
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
     if FLAGS.load_dataset_state != '':
         dataset.load_state_dict(mlxu.load_pickle(FLAGS.load_dataset_state))
+        print('loaded dataset state', flush=True)
 
     if FLAGS.eval_steps > 0:
         eval_dataset = DatasetFactory.load_dataset(
@@ -580,13 +581,12 @@ def main(argv):
                 # dataset_path = os.path.join(output_dir, 'dataset.pkl')
                 # dataset.load_state_dict(mlxu.load_pickle(dataset_path))
 
-                # print('loaded dataset state', dataset_path, flush=True)
-                
-                start_step = int(jax.device_get(train_state.step))
-                start_tokens = int(jax.device_get(train_state.step)) * FLAGS.train_dataset_batch_size * seq_length + FLAGS.train_dataset.huggingface_dataset.tokens_count_at_start
-                dataset.set_start_tokens(start_tokens)
-                print('loaded checkpoint, starting at step', start_step, flush=True)
-                print('\tstart tokens:', start_tokens)
+                if FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir != '':
+                    start_step = int(jax.device_get(train_state.step))
+                    start_tokens = int(jax.device_get(train_state.step)) * FLAGS.train_dataset_batch_size * seq_length + FLAGS.train_dataset.huggingface_dataset.tokens_count_at_start
+                    dataset.set_start_tokens(start_tokens)
+                    print('loaded checkpoint, starting at step', start_step, flush=True)
+                    print('\tstart tokens:', start_tokens)
 
         if train_state is None and restored_params is None:
             # Initialize from scratch

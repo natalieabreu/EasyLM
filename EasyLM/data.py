@@ -8,6 +8,7 @@ import mlxu
 import numpy as np
 from datasets import load_dataset, load_from_disk, Dataset
 
+import jax
 
 
 import os
@@ -33,8 +34,8 @@ class DatasetFactory(object):
                 config.huggingface_dataset, tokenizer, text_processor, **kwargs
             )
         elif config.type == 'huggingface':
-            raise ValueError('Huggingface dataset is not supported in this version.')
-            # return HuggingfaceDataset(config.huggingface_dataset, tokenizer, text_processor, **kwargs)
+            # raise ValueError('Huggingface dataset is not supported in this version.')
+            return HuggingfaceDataset(config.huggingface_dataset, tokenizer, text_processor, **kwargs)
         elif config.type == 'json':
             return JsonDataset(config.json_dataset, tokenizer, text_processor, **kwargs)
         else:
@@ -159,6 +160,10 @@ class HuggingfaceDataset(object):
         self._dataset = load_dataset(
             self.config.path, name, split=split, streaming=self.config.streaming
         )
+        self.metadata = {
+            'dataset_example_index': 0,
+            'dataset_total_tokens': self.config.tokens_count_at_start,
+        }
 
         # if self.config.tokens_count_at_start > 0:
         #     print(f"Skipping {self.config.tokens_count_at_start} tokens at the start of the dataset.", flush=True)
@@ -170,7 +175,7 @@ class HuggingfaceDataset(object):
 
     def __iter__(self):
         chunk_size = self.config.batch_size * self.config.seq_length
-        total_tokens = self.config.tokens_count_at_start
+        total_tokens = self.metadata['dataset_total_tokens']
 
         tokens_to_skip = self.config.tokens_count_at_start
         # tokens_to_skip = 0
@@ -223,13 +228,13 @@ class HuggingfaceDataset(object):
             #     skip_token_buffer = []
             #     skip_loss_mask_buffer = []
 
-            for index, example in enumerate(dataset_iterator):
+            for index, example in enumerate(dataset_iterator, start=self.metadata['dataset_example_index']):
                 tokens, loss_masks = self.text_processor(example)
                 token_buffer.extend(tokens)
                 loss_mask_buffer.extend(loss_masks)
                 while len(token_buffer) > chunk_size + 1:
                     total_tokens += chunk_size
-                    metrics = {
+                    self.metadata = {
                         'dataset_example_index': index,
                         'dataset_total_tokens': total_tokens,
                     }
@@ -246,16 +251,22 @@ class HuggingfaceDataset(object):
                     }
                     if self.config.always_start_with_bos:
                         batch['input_tokens'][:, 0] = self.tokenizer.bos_token_id
-                    yield batch, metrics
+                    yield batch, self.metadata
                     token_buffer = token_buffer[chunk_size:]
                     loss_mask_buffer = loss_mask_buffer[chunk_size:]
 
     def get_state_dict(self):
-        return dict(config=self.config)
+        print(f"Saving state; Starting from step {self.metadata['dataset_example_index']}.", flush=True)
+        self.metadata = jax.device_get(self.metadata)
+        return dict(config=self.config, metadata=self.metadata)
 
     def load_state_dict(self, state_dict):
         if 'config' in state_dict:
             self.config.update(mlxu.ConfigDict(state_dict['config']))
+        self.metadata = state_dict.get('metadata', self.metadata)
+        self._dataset = self._dataset.skip(self.metadata['dataset_example_index']+1)
+
+        print(f"Loaded state; Starting from step {self.metadata['dataset_example_index']}.", flush=True)
 
     def set_start_tokens(self, tokens):
         print(f'Dataset: setting start tokens to {tokens}')

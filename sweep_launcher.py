@@ -142,10 +142,15 @@ def main():
             print(f"Checkpoint exists: {checkpoint_path}", flush=True)
        
             ckpt = os.path.join(checkpoint_path, "streaming_train_state")
+            dataset_path = os.path.join(checkpoint_path, "dataset.pkl")
 
             if (is_gcs and gcs_path_exists(ckpt)) or (not is_gcs and os.path.exists(ckpt)):
                 print(f"Resuming from path: {ckpt}", flush=True)
                 static_flags = set_static_flag(static_flags, 'load_checkpoint', f"trainstate::{ckpt}")
+
+                pretokenized_dir = config.get('train_dataset.huggingface_dataset.pretokenized_dataset_dir') or next((arg.split('=')[1] for arg in static_flags if arg.startswith('--train_dataset.huggingface_dataset.pretokenized_dataset_dir=')), None)
+                if not pretokenized_dir: # need to load state for non-pretokenized version
+                    static_flags = set_static_flag(static_flags, 'load_dataset_state', f"{dataset_path}")
 
                 ema_path = os.path.join(checkpoint_path, "streaming_ema_params")
                 if (is_gcs and gcs_path_exists(ema_path)) or (not is_gcs and os.path.exists(ema_path)):
