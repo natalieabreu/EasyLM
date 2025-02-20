@@ -140,7 +140,8 @@ def main(argv):
         FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir = os.path.join(tmp_dir, 'train_dataset')
     if FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://'):
         FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir = load_from_gcs(FLAGS.eval_dataset.huggingface_dataset.pretokenized_dataset_dir, os.path.join(FLAGS.tmp_dir,'eval_dataset'))
-        
+    if FLAGS.load_dataset_state != '' and FLAGS.load_dataset_state.startswith('gs://'):
+        FLAGS.load_dataset_state = load_from_gcs(FLAGS.load_dataset_state, os.path.join(FLAGS.tmp_dir, 'dataset_state.pkl')) 
 
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
