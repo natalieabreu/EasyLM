@@ -64,10 +64,21 @@ class StreamingCheckpointer(object):
             local_path = tmp_file.name
 
         # Save the train state locally
+        # with mlxu.open_file(local_path, "wb") as fout:
+        #     for key, value in flattend_train_state.items():
+        #         print(key)
+        #         if gather_fns is not None:
+        #             value = gather_fns[key](value)
+        #         value = float_tensor_to_dtype(value, float_dtype)
+        #         fout.write(packer.pack((key, to_bytes(value))))
+        
         with mlxu.open_file(local_path, "wb") as fout:
             for key, value in flattend_train_state.items():
                 if gather_fns is not None:
-                    value = gather_fns[key](value)
+                    gather_fn = gather_fns.get(key)
+                    if gather_fn is None:
+                        gather_fn = lambda x: x  # identity, safe for 1 GPU
+                    value = gather_fn(value)
                 value = float_tensor_to_dtype(value, float_dtype)
                 fout.write(packer.pack((key, to_bytes(value))))
 
@@ -148,7 +159,10 @@ class StreamingCheckpointer(object):
 
                 tensor = from_bytes(None, value)
                 if shard_fns is not None:
-                    tensor = shard_fns[key](tensor)
+                    shard_fn = shard_fns.get(key)
+                    if shard_fn is None:
+                        shard_fn = lambda x: x
+                    tensor = shard_fn(tensor)
                 flattend_train_state[key] = tensor
 
         if target is not None:

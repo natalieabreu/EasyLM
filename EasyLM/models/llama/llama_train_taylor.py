@@ -36,6 +36,7 @@ from EasyLM.jax_utils import (
     cross_entropy_loss_and_accuracy, global_norm, get_float_dtype_by_name,
     set_random_seed, average_metrics, make_shard_and_gather_fns,
     with_sharding_constraint, cross_entropy_loss_and_accuracy_with_weight_decay,
+    cross_entropy_loss_and_accuracy_with_weight_decay_to_taylorize, taylor_test_loss,
     get_gpu_memory, get_ram, count_params, print_shape, display_top
 )
 from EasyLM.models.llama.llama_model import (
@@ -83,6 +84,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     inner_b2=0.999,
     inner_clip_gradient=0.0,
     optimizer_wd=0.0,
+    parameter_wd=0.0,
 
     wandb_run_id='',
     start_tokens=0,
@@ -97,6 +99,11 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     weight_average=False,
     weight_average_decay=0.99,
     load_ema_checkpoint='',
+
+    gauss_newton=False,
+    redo_gn=0,
+
+    target_loss=0.0
 )
 
 def main(argv):
@@ -189,6 +196,45 @@ def main(argv):
 
             schedule = optax.join_schedules(schedules, boundaries)
 
+        elif method == 'constant_with_inner_cosine':
+            decay_steps = taylor_steps
+            decay_steps = int(decay_steps)
+            if warmup <= 1.0:
+                warmup = int(warmup*decay_steps)
+            if isinstance(warmup, tuple):
+                warmup = int(warmup[0])
+
+            if inner_warmup <= 1.0:
+                inner_warmup = int(inner_warmup*inner_loop_iter)
+            if isinstance(inner_warmup, tuple):
+                inner_warmup = int(inner_warmup[0])
+
+            if warmup == 0:
+                init_value = lr
+            else:
+                init_value = lr*0.1
+            
+            global_sched = optax.warmup_constant_schedule(
+                init_value=init_value,
+                peak_value=lr,
+                warmup_steps=warmup,
+            )
+            schedules = []
+            boundaries = []
+            for step in range(taylor_steps):
+                peak_lr = global_sched(step)
+                inner_sched = optax.warmup_cosine_decay_schedule(
+                    init_value=peak_lr*0.1,
+                    peak_value=peak_lr,
+                    warmup_steps=inner_warmup,
+                    decay_steps=inner_loop_iter,
+                    end_value=end_lr,
+                )
+                schedules.append(inner_sched)
+                boundaries.append((step+1)*inner_loop_iter)
+
+            schedule = optax.join_schedules(schedules, boundaries[:-1])
+
         elif method == 'constant':
             schedule = optax.constant_schedule(lr)
         else:
@@ -260,12 +306,12 @@ def main(argv):
                 # 2) Build the selector tree
                 flat_selector = {}
                 for name_tuple, param in flat_params.items():
-                    print(name_tuple)
+                    # print(name_tuple)
                     if name_tuple in first_layer_keys or name_tuple in last_layer_keys:
-                        print(f"Assigning param '{name_tuple}' (shape={param.shape}) to ADAMW.")
+                        # print(f"Assigning param '{name_tuple}' (shape={param.shape}) to ADAMW.")
                         flat_selector[name_tuple] = 'adamw'
                     else:
-                        print(f"Assigning param '{name_tuple}' (shape={param.shape}) to MUON.")
+                        # print(f"Assigning param '{name_tuple}' (shape={param.shape}) to MUON.")
                         flat_selector[name_tuple] = 'muon'
 
                 # 3) Unflatten back to the original param-tree structure
@@ -460,7 +506,7 @@ def main(argv):
             logits, batch['target_tokens'], batch['loss_masks']
         )
     
-    def apply_taylor_fn(f_tayl, batch, rng, new_params, old_params, weight_decay):
+    def apply_taylor_fn(f_tayl, batch, rng, new_params, old_params, weight_decay, gauss_newton=False):
             
             rng_generator = JaxRNG(rng)
             batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
@@ -473,10 +519,53 @@ def main(argv):
 
                 return cross_entropy_loss_and_accuracy_with_weight_decay(logits, batch['target_tokens'], params, old_params, batch['loss_masks'], weight_decay=weight_decay)
             
-            grad_fn = jax.value_and_grad(loss_and_accuracy_with_wd, has_aux=True)
+            if gauss_newton:
+                l_tayl = nt.taylor_expand(loss_and_accuracy_with_wd, old_params, 2)
+                grad_fn = jax.value_and_grad(l_tayl, has_aux=True)
+            else:
+                grad_fn = jax.value_and_grad(loss_and_accuracy_with_wd, has_aux=True)
             (wd_loss, aux), grads = grad_fn(new_params, old_params)
             accuracy, base_loss = aux
             return grads, base_loss, accuracy, wd_loss
+    
+    def apply_taylor_fn_test(f_tayl, batch, rng, new_params, old_params, weight_decay, gauss_newton=False):
+            
+            rng_generator = JaxRNG(rng)
+            batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+
+            def loss_and_accuracy_with_wd(params, old_params):
+                logits = f_tayl(
+                    params, batch['input_tokens'], deterministic=False,
+                    rngs=rng_generator(LLaMAConfigurator.rng_keys()),
+                ).logits
+
+                return taylor_test_loss(logits, batch['target_tokens'], params, old_params, batch['loss_masks'], weight_decay=weight_decay)
+            
+            if gauss_newton:
+                l_tayl = nt.taylor_expand(loss_and_accuracy_with_wd, old_params, 2)
+                grad_fn = jax.value_and_grad(l_tayl)
+            else:
+                grad_fn = jax.value_and_grad(loss_and_accuracy_with_wd)
+            wd_loss, grads = grad_fn(new_params, old_params)
+            return grads, 0, 0, wd_loss
+    
+    # def apply_taylor_fn_2(f_tayl, l_tayl, batch, rng, new_params, old_params, weight_decay, gauss_newton=False):
+            
+    #         rng_generator = JaxRNG(rng)
+    #         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
+
+    #         def loss_and_accuracy_with_wd(params, old_params):
+    #             logits = f_tayl(
+    #                 params, batch['input_tokens'], deterministic=False,
+    #                 rngs=rng_generator(LLaMAConfigurator.rng_keys()),
+    #             ).logits
+
+    #             return l_tayl(params, old_params, logits, batch['target_tokens'], batch['loss_masks'], weight_decay=weight_decay)
+            
+    #         grad_fn = jax.value_and_grad(loss_and_accuracy_with_wd, argnums=0, has_aux=True)
+    #         (wd_loss, aux), grads = grad_fn(new_params, old_params)
+    #         accuracy, base_loss = aux
+    #         return grads, base_loss, accuracy, wd_loss
     
 
     batch_size = FLAGS.train_dataset_batch_size
@@ -577,7 +666,14 @@ def main(argv):
 
             f_tayl = nt.taylor_expand(model.apply, train_state.params, FLAGS.taylor_order)
 
-            parallel_apply_taylor_fn = partial(apply_taylor_fn, f_tayl)
+            if FLAGS.redo_gn == 2:
+                l_tayl = nt.taylor_expand(cross_entropy_loss_and_accuracy_with_weight_decay_to_taylorize, train_state.params, 2)
+                parallel_apply_taylor_fn = partial(apply_taylor_fn_2, f_tayl, l_tayl, gauss_newton=FLAGS.gauss_newton)
+            elif FLAGS.redo_gn == 3:
+                parallel_apply_taylor_fn = partial(apply_taylor_fn_test, f_tayl, gauss_newton=FLAGS.gauss_newton)
+            else:
+                parallel_apply_taylor_fn = partial(apply_taylor_fn, f_tayl, gauss_newton=FLAGS.gauss_newton)
+
             parallel_apply_taylor_fn = jax.pmap(parallel_apply_taylor_fn, axis_name='batch')
             
             inner_losses = []
@@ -612,7 +708,10 @@ def main(argv):
                 del sharded_new_params, sharded_batch, sharded_rng_rep
                 # old_params = new_params  # Should this be per inner step or per param update?
                 updates, opt_state = tayl_solver.update(grads, opt_state, new_params)
+                delta = jax.tree_util.tree_map(lambda x, y: x - y, new_params, train_state.params)
                 new_params = optax.apply_updates(new_params, updates)
+                new_params = jax.tree_util.tree_map(lambda x, y: x - FLAGS.parameter_wd*y, new_params, delta)
+                
 
                 del grads, updates
 
@@ -671,8 +770,10 @@ def main(argv):
                 #     for line in stat.traceback.format():
                 #         print(line, flush=True)
                 # display_top(snapshot)
+                
+            do_eval = FLAGS.eval_freq and FLAGS.eval_steps > 0 and ((global_step % FLAGS.eval_freq == 0 and global_step <= FLAGS.total_steps * 0.5) or (global_step % FLAGS.log_freq == 0 and global_step > FLAGS.total_steps * 0.5))
             
-            if FLAGS.eval_freq and global_step % FLAGS.eval_freq == 0 and FLAGS.eval_steps > 0:
+            if do_eval:
                 eval_iterator = iter(eval_dataset)
                 eval_metric_list = []
                 if FLAGS.weight_average:
@@ -692,6 +793,13 @@ def main(argv):
                 avg_metrics.update({'global_step': global_step})
                 avg_metrics = jax.device_get(avg_metrics)
                 wandb.log(avg_metrics)
+
+                if FLAGS.target_loss > 0.0 and avg_metrics['eval_loss'] <= FLAGS.target_loss:
+                    print(f"Target loss {FLAGS.target_loss} reached with loss {avg_metrics['eval_loss']}, stopping at step {global_step}")
+                    break
+                elif FLAGS.target_loss > 0.0 and avg_metrics['eval_loss'] >= 10:
+                    print(f"Loss {avg_metrics['eval_loss']} too high, stopping at step {global_step}")
+                    break
                 # if FLAGS.weight_average:
                 #     run_evaluation(ema, eval_dataset, global_step, dataset_metrics['dataset_total_tokens'])
                 # else:

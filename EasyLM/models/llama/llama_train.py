@@ -12,6 +12,7 @@ import neural_tangents as nt
 import timeit
 import os
 import wandb
+import copy
 
 import jax
 import jax.numpy as jnp
@@ -72,12 +73,15 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     experiment_id='',
     gcs_num_train_files_to_download=300,
     tmp_dir='/tmp',
+    load_ema_checkpoint='',
 
     wandb_run_id='',
     wandb_project='',
     wandb_dir='/n/netscratch/kempner_barak_lab/Lab/nabreu/SOO-LM/experiment_output/open_llama_7b',
     output_dir='',
     notes='',
+    
+    target_loss=0.0,
 )
 
 def get_gpu_memory():
@@ -541,7 +545,7 @@ def main(argv):
         donate_argnums=(1,),
     )
 
-    def save_checkpoint(train_state, milestone=False):
+    def save_checkpoint(train_state, ema=None, milestone=False):
         step = int(jax.device_get(train_state.step))
         metadata = dict(
             step=step,
@@ -553,9 +557,11 @@ def main(argv):
             train_state=train_state,
             gather_fns=gather_fns,
             metadata=metadata,
-            dataset=dataset.get_state_dict(),
+            ema=ema,
+            # dataset=dataset.get_state_dict(),
             milestone=milestone,
         )
+    
 
     def shard_batch(batch, num_devices):
         # Shard each tensor along the first axis
@@ -581,6 +587,11 @@ def main(argv):
             if train_state is not None and output_dir in init_checkpoint_path: # need to distinguish between loading adam initial ckpt and taylor mid-run ckpt
                 # dataset_path = os.path.join(output_dir, 'dataset.pkl')
                 # dataset.load_state_dict(mlxu.load_pickle(dataset_path))
+                
+                if FLAGS.weight_average:
+                    _, ema = checkpointer.load_trainstate_checkpoint(
+                        FLAGS.load_ema_checkpoint, train_state_shapes, shard_fns
+                    )
 
                 if FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir != '':
                     start_step = int(jax.device_get(train_state.step))
@@ -629,9 +640,16 @@ def main(argv):
 
 
         start_step = int(jax.device_get(train_state.step))
+        
+        def copy_array(x):
+            return copy.copy(x)  # or x.copy() if x is a NumPy/JAX array
 
         if FLAGS.save_model_freq > 0:
-            save_checkpoint(train_state)
+            if FLAGS.weight_average:
+                ema = jax.tree_map(copy_array, train_state.params)
+                save_checkpoint(train_state, ema=ema)
+            else:
+                save_checkpoint(train_state)
 
         sharded_rng = next_rng()
 
@@ -640,9 +658,11 @@ def main(argv):
         assert FLAGS.train_dataset_batch_size % mesh.shape['dp'] == 0, \
             "Batch size must be divisible by the number of devices in 'dp'."
         
+        
+        
         if FLAGS.weight_average:
             print('Using weight average')
-            ema = train_state.params
+            ema = jax.tree_map(copy_array, train_state.params)
 
         for step, (batch, dataset_metrics) in zip(step_counter, dataset):
 
@@ -657,7 +677,9 @@ def main(argv):
 
             if FLAGS.weight_average:
                 alpha = FLAGS.weight_average_decay
-                ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, train_state.params)
+                # device get train_state params
+                train_state_params = jax.device_get(train_state.params)
+                ema = jax.tree_util.tree_map(lambda x, y: alpha*x + (1-alpha)*y, ema, train_state_params)
 
             
 
@@ -667,25 +689,37 @@ def main(argv):
                 log_metrics.update(dataset_metrics)
                 
 
-                if FLAGS.eval_freq != 0 and FLAGS.eval_steps > 0: # eval_freq must be | by log_freq
-                    if step % FLAGS.eval_freq == 0:
-                        eval_iterator = iter(eval_dataset)
-                        eval_metric_list = []
-                        for _ in range(FLAGS.eval_steps):
-                            eval_batch, _ = next(eval_iterator)
+                do_eval = FLAGS.eval_freq and FLAGS.eval_steps > 0 and ((step % FLAGS.eval_freq == 0 and step <= FLAGS.total_steps * 0.5) or (step % FLAGS.log_freq == 0 and step > FLAGS.total_steps * 0.5))
 
-                            if FLAGS.weight_average:
-                                eval_params=ema
-                            else:
-                                eval_params = train_state.params
-                            sharded_rng, eval_metrics = sharded_eval_step(
-                                eval_params, sharded_rng, eval_batch
-                            )
-                            eval_metric_list.append(eval_metrics)
-                        log_metrics.update(average_metrics(eval_metric_list))
-                        # metrics.update({"step": step})
-                        # metrics = jax.device_get(metrics)
-                        # logger.log(metrics)
+                if do_eval: # eval_freq must be | by log_freq
+                    eval_iterator = iter(eval_dataset)
+                    eval_metric_list = []
+                    for _ in range(FLAGS.eval_steps):
+                        eval_batch, _ = next(eval_iterator)
+
+                        if FLAGS.weight_average:
+                            eval_params=ema
+                        else:
+                            eval_params = train_state.params
+                        sharded_rng, eval_metrics = sharded_eval_step(
+                            eval_params, sharded_rng, eval_batch
+                        )
+                        eval_metric_list.append(eval_metrics)
+                    log_metrics.update(average_metrics(eval_metric_list))
+                    
+                    if FLAGS.target_loss > 0.0 and log_metrics['eval_loss'] <= FLAGS.target_loss:
+                        print(f"Target loss {FLAGS.target_loss} reached with loss {log_metrics['eval_loss']}, stopping at step {step}")
+                        log_metrics = jax.device_get(log_metrics)
+                        wandb.log(log_metrics)
+                        tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
+                        
+                        break
+                    elif FLAGS.target_loss > 0.0 and log_metrics['eval_loss'] >= 15:
+                        print(f"Loss {log_metrics['eval_loss']} too high, stopping at step {step}")
+                        break
+                    # metrics.update({"step": step})
+                    # metrics = jax.device_get(metrics)
+                    # logger.log(metrics)
                 log_metrics = jax.device_get(log_metrics)
                 wandb.log(log_metrics)
                 tqdm.write("\n" + pprint.pformat(log_metrics) + "\n")
@@ -693,10 +727,17 @@ def main(argv):
             
 
             if FLAGS.save_milestone_freq > 0 and (step + 1) % FLAGS.save_milestone_freq == 0:
-                save_checkpoint(train_state, milestone=True)
+                if FLAGS.weight_average:
+                    ema = jax.device_get(ema)
+                    save_checkpoint(train_state, ema=ema, milestone=True)
+                else:
+                    save_checkpoint(train_state, milestone=True)
             elif FLAGS.save_model_freq > 0 and (step + 1) % FLAGS.save_model_freq == 0:
-                print('saving checkpoint', flush=True)
-                save_checkpoint(train_state)
+                if FLAGS.weight_average:
+                    ema = jax.device_get(ema)
+                    save_checkpoint(train_state, ema=ema)
+                else:
+                    save_checkpoint(train_state)
 
         if FLAGS.eval_freq != 0 and FLAGS.eval_steps > 0: # eval_freq must be | by log_freq
             eval_iterator = iter(eval_dataset)

@@ -86,6 +86,7 @@ class MuonOptimizerFactory(object):
         config.lr_decay_steps = 500000
         config.b1 = 0.9
         config.b2 = 0.95
+        config.beta = 0.95
         config.clip_gradient = 1.0
         config.weight_decay = 1e-4
         config.bf16_momentum = False
@@ -107,7 +108,13 @@ class MuonOptimizerFactory(object):
                 decay_steps=config.lr_decay_steps,
                 end_value=config.end_lr,
             )
-        elif config.lr_sched == 'constant':
+        elif config.lr_sched == 'constant_with_warmup' and config.lr_warmup_steps > 0:
+            learning_rate_schedule = optax.warmup_constant_schedule(
+                init_value=config.init_lr,
+                peak_value=config.lr,
+                warmup_steps=config.lr_warmup_steps,
+            )
+        elif config.lr_sched == 'constant' or (config.lr_sched == 'constant_with_warmup' and config.lr_warmup_steps == 0):
             learning_rate_schedule = optax.constant_schedule(config.lr)
         else:
             raise ValueError(f'Unknown inner loop schedule: {config.inner_loop_sched}')
@@ -138,6 +145,7 @@ class MuonOptimizerFactory(object):
                 adam_weight_decay=config.weight_decay,
                 adam_b1=config.b1,
                 adam_b2=config.b2,
+                beta=config.beta,
                 mu_dtype=jnp.bfloat16 if config.bf16_momentum else jnp.float32,
             ),
         )
@@ -223,8 +231,15 @@ class SOAPOptimizerFactory(object):
                 decay_steps=config.lr_decay_steps,
                 end_value=config.end_lr,
             )
-        elif config.lr_sched == 'constant':
+        elif config.lr_sched == 'constant_with_warmup' and config.lr_warmup_steps > 0:
+            learning_rate_schedule = optax.warmup_constant_schedule(
+                init_value=config.init_lr,
+                peak_value=config.lr,
+                warmup_steps=config.lr_warmup_steps,
+            )
+        elif config.lr_sched == 'constant' or (config.lr_sched == 'constant_with_warmup' and config.lr_warmup_steps == 0):
             learning_rate_schedule = optax.constant_schedule(config.lr)
+        
         else:
             raise ValueError(f'Unknown inner loop schedule: {config.inner_loop_sched}')
         
@@ -401,10 +416,16 @@ class AdamWOptimizerFactory(object):
                 decay_steps=config.lr_decay_steps,
                 end_value=config.end_lr,
             )
-        elif config.lr_sched == 'constant':
+        elif config.lr_sched == 'constant_with_warmup' and config.lr_warmup_steps > 0:
+            learning_rate_schedule = optax.warmup_constant_schedule(
+                init_value=config.init_lr,
+                peak_value=config.lr,
+                warmup_steps=config.lr_warmup_steps,
+            )
+        elif config.lr_sched == 'constant' or (config.lr_sched == 'constant_with_warmup' and config.lr_warmup_steps == 0):
             learning_rate_schedule = optax.constant_schedule(config.lr)
         else:
-            raise ValueError(f'Unknown inner loop schedule: {config.inner_loop_sched}')
+            raise ValueError(f'Unknown inner loop schedule: {config.lr_sched}')
         
         optimizer_info = dict(
             learning_rate_schedule=learning_rate_schedule,
