@@ -145,7 +145,8 @@ def main(argv):
     if FLAGS.load_dataset_state != '' and FLAGS.load_dataset_state.startswith('gs://'):
         FLAGS.load_dataset_state = load_from_gcs(FLAGS.load_dataset_state, os.path.join(FLAGS.tmp_dir, 'dataset_state.pkl')) 
 
-    dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, None)
+    tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer)
+    dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
     if FLAGS.load_dataset_state != '':
         dataset.load_state_dict(mlxu.load_pickle(FLAGS.load_dataset_state))
 
