@@ -674,7 +674,7 @@ def main(argv):
         params = train_state.params
         old_params = params  # Initialize old_params
 
-        dataset = iter(dataset)
+        dataset_it = iter(dataset)
 
         # global_step = 0  # To keep track of the global step for logging
 
@@ -713,7 +713,7 @@ def main(argv):
             
             inner_losses = []
             for i in range(FLAGS.inner_loop_iter):
-                batch, dataset_metrics = next(dataset)
+                batch, dataset_metrics = next(dataset_it)
 
                 sharded_batch = shard_batch(batch, num_devices)
                 # print_shape(sharded_batch, prefix='sharded batch:')
