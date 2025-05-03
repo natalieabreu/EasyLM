@@ -514,7 +514,7 @@ def main(argv):
             gather_fns=gather_fns,
             metadata=metadata,
             ema=ema,
-            # dataset=dataset.get_state_dict(),
+            dataset=dataset.get_state_dict(),
             milestone=milestone,
         )
     
