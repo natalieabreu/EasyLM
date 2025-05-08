@@ -130,6 +130,7 @@ def main(argv):
 
     assert FLAGS.gradient_accumulation_steps == 1, 'Gradient accumulation not supported'
 
+    orig_load_checkpoint = FLAGS.load_checkpoint
     if FLAGS.load_checkpoint.split('::')[-1].startswith('gs://'):
         FLAGS.load_checkpoint = load_ckpt_from_gcs(FLAGS.load_checkpoint, local_path=os.path.join(FLAGS.tmp_dir, 'model.ckpt'))
     if FLAGS.train_dataset.huggingface_dataset.pretokenized_dataset_dir.startswith('gs://'):
@@ -613,7 +614,7 @@ def main(argv):
                 FLAGS.load_checkpoint, train_state_shapes, shard_fns
             )
             # distinguish between loading from train_state and loading from params
-            if train_state is not None and output_dir in FLAGS.load_checkpoint: # need to distinguish between loading adam initial ckpt and taylor mid-run ckpt
+            if train_state is not None and output_dir in orig_load_checkpoint: # need to distinguish between loading adam initial ckpt and taylor mid-run ckpt
                 start_step = int(jax.device_get(train_state.step))
                 start_tokens = int(jax.device_get(train_state.step)) * FLAGS.inner_loop_iter * batch_size * seq_length + FLAGS.train_dataset.huggingface_dataset.tokens_count_at_start
                 dataset.set_start_tokens(start_tokens)
