@@ -99,6 +99,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     weight_average=False,
     weight_average_decay=0.99,
     load_ema_checkpoint='',
+    linesearch=False,
 
     gauss_newton=False,
     redo_gn=0,
@@ -122,6 +123,7 @@ def main(argv):
     set_random_seed(FLAGS.seed)
 
     assert FLAGS.gradient_accumulation_steps == 1, 'Gradient accumulation not supported'
+    assert not (FLAGS.weight_average and FLAGS.linesearch), 'Weight averaging and line search not supported together'
 
     dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, None)
     if FLAGS.load_dataset_state != '':
@@ -723,11 +725,53 @@ def main(argv):
                 rng = next_rng()
 
             del parallel_apply_taylor_fn, f_tayl
-            train_state = train_state.replace(
-                step=train_state.step+1,
-                opt_state=opt_state,
-                params=new_params
-            )
+            
+            if FLAGS.linesearch:
+                exit = False
+                pre_fetched_batches = []
+                for _ in range(FLAGS.inner_loop_iter): # new data
+                    try:
+                        batch, _ = next(dataset)
+                        pre_fetched_batches.append(batch)
+                    except StopIteration:
+                        print('Dataset exhausted')
+                        exit = True
+                        break
+                
+                if exit:
+                    break
+                # loss_partial = partial(compute_average_loss, dataset=dataset, rng=sharded_rng, loss_fn=loss_fn, batch_accumulation_steps=FLAGS.inner_loop_iter*gradient_accumulation_steps)
+                dir = jax.tree_util.tree_map(lambda x, y: x - y, new_params, train_state.params)
+                losses = []
+                for step_size in [1/jnp.sqrt(2)**i for i in range(5)]:
+                    # Compute loss using pre-fetched batches
+                    updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
+                    accumulated_loss = 0.0
+                    for batch in pre_fetched_batches:
+                        sharded_rng, subrng = jax.random.split(sharded_rng)
+                        loss, _ = loss_fn(updated_params, batch, subrng)
+                        accumulated_loss += loss
+                    
+                    average_loss = accumulated_loss / len(pre_fetched_batches)
+                    losses.append((step_size, average_loss))
+                step_size, loss = min(losses, key=lambda x: x[1])
+                step_size = jax.device_get(step_size)
+                print('Step size:', step_size)
+                wandb.log({
+                    'step_size': step_size,
+                    'global_step': global_step,
+                    })
+                updated_params = jax.tree_util.tree_map(lambda x, y: x + step_size*y, train_state.params, dir)
+                train_state = train_state.replace(
+                    step=train_state.step+1,
+                    params=updated_params
+                )
+            else:
+                train_state = train_state.replace(
+                    step=train_state.step+1,
+                    opt_state=opt_state,
+                    params=new_params
+                )
 
             if global_step % 50 == 0:
                 jax.clear_caches()
